@@ -37,13 +37,14 @@ api.{{DOMAIN}}:8443 {
 }
 
 # ─── edge-control admin (chỉ dun-api → edge calls) ──────────────
+# KHÔNG khai báo `tls { dns }` riêng — Caddy tự match wildcard cert
+# `*.sin.{{DOMAIN}}` đã obtain ở site block dưới. Tránh obtain cert
+# riêng cho edge.sin (thừa + tốn ACME quota).
 edge.{{REGION}}.{{DOMAIN}}:8443 {
     tls {
         dns cloudflare {env.CLOUDFLARE_API_TOKEN}
     }
-    reverse_proxy 127.0.0.1:9443 {
-        header_up X-Real-IP {remote_host}
-    }
+    reverse_proxy 127.0.0.1:9443
 }
 
 # ─── viewer wildcard — dynamic routes injected by edge-caddy-bridge ─
