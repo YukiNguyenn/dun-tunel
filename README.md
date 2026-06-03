@@ -46,12 +46,11 @@ sudo ufw enable
 ### 3. Clone repo + bootstrap dirs
 
 ```bash
-git clone <repo-url> /opt/dun-tunel
-cd /opt/dun-tunel
+git clone <repo-url> ~/dun-tunel
+cd ~/dun-tunel
 
 # Persistent state cho bandwidth sequence + rathole config
-sudo mkdir -p /etc/rathole /var/lib/dun-tunel/queue
-sudo chown -R $USER:$USER /var/lib/dun-tunel /etc/rathole
+mkdir -p ~/dun-tunel/state/rathole ~/dun-tunel/state/queue
 ```
 
 ### 4. Sinh secret

@@ -44,8 +44,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/edge-control /usr/local/bin/edge-control
-RUN useradd --system --no-create-home --shell /usr/sbin/nologin edge
+# Pin UID/GID = 1500 để host bind-mount chown thuận tiện
+# (`sudo chown -R 1500:1500 ../state` trên host).
+RUN groupadd --system --gid 1500 edge \
+    && useradd --system --uid 1500 --gid 1500 \
+       --no-create-home --shell /usr/sbin/nologin edge \
+    && mkdir -p /state/rathole /state/queue \
+    && chown -R edge:edge /state
 
 USER edge
-EXPOSE 8443
+EXPOSE 9443
 ENTRYPOINT ["/usr/local/bin/edge-control"]

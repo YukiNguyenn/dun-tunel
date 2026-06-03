@@ -1,7 +1,18 @@
-version: "3.9"
-
-# Edge_Server stack per region. Deploy 1 instance per VPS.
-# Set REGION_ID env when launching: REGION_ID=sin docker compose up -d
+# Edge_Server stack per region — Phase 1 single-VPS layout.
+# Deploy 1 instance per region VPS.
+#
+# Run from `deploy/` directory; compose resolves `${PWD}/../state/`
+# tới folder state ngang hàng với deploy/. Layout:
+#   ~/dun-tunel/
+#   ├── deploy/
+#   │   ├── docker-compose.yml   (file này)
+#   │   ├── Caddyfile            (rendered từ Caddyfile.tpl)
+#   │   └── .env                 (config)
+#   └── state/
+#       ├── rathole/server.toml  (rendered từ rathole.tpl.toml)
+#       ├── queue/                (bandwidth sequence persistence)
+#       ├── caddy_data/           (Caddy auto-managed certs)
+#       └── caddy_config/
 
 services:
   edge-control:
@@ -14,20 +25,21 @@ services:
     network_mode: host
     environment:
       REGION_ID: ${REGION_ID:?REGION_ID required}
-      EDGE_BIND_PORT: "8443"
+      EDGE_BIND_PORT: "9443"
       DUN_API_ENDPOINT: ${DUN_API_ENDPOINT:?DUN_API_ENDPOINT required}
       DUN_API_KEY: ${DUN_API_KEY:?DUN_API_KEY required}
       CADDY_ADMIN_URL: "http://127.0.0.1:2019"
-      RATHOLE_CONFIG_PATH: "/etc/rathole/server.toml"
-      PERSISTENT_QUEUE_DIR: "/var/lib/dun-tunel/queue"
+      RATHOLE_CONFIG_PATH: "/state/rathole/server.toml"
+      PERSISTENT_QUEUE_DIR: "/state/queue"
       TUNNEL_JWT_SECRET_V1: ${TUNNEL_JWT_SECRET_V1:-}
       TUNNEL_JWT_SECRET_V2: ${TUNNEL_JWT_SECRET_V2:-}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
-      - /etc/rathole:/etc/rathole:ro
-      - /var/lib/dun-tunel/queue:/var/lib/dun-tunel/queue
+      # Read-write: bridge rewrite rathole config + persist sequence
+      - ../state/rathole:/state/rathole
+      - ../state/queue:/state/queue
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8443/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9443/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -41,18 +53,14 @@ services:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN required}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+      - ../state/caddy_data:/data
+      - ../state/caddy_config:/config
 
   rathole:
     image: rapiz1/rathole:latest
     container_name: rathole-server
     restart: unless-stopped
     network_mode: host
-    command: ["--server", "/etc/rathole/server.toml"]
+    command: ["--server", "/state/rathole/server.toml"]
     volumes:
-      - /etc/rathole:/etc/rathole:ro
-
-volumes:
-  caddy_data:
-  caddy_config:
+      - ../state/rathole:/state/rathole:ro
