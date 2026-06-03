@@ -45,7 +45,13 @@ services:
       retries: 3
 
   caddy:
-    image: caddy:2-alpine
+    # Stock `caddy:2-alpine` KHÔNG có module cloudflare DNS. Build
+    # custom image (Caddyfile.Dockerfile) qua xcaddy kèm
+    # `caddy-dns/cloudflare` để DNS-01 challenge hoạt động.
+    build:
+      context: .
+      dockerfile: Caddyfile.Dockerfile
+    image: dun-tunel/caddy-cloudflare:latest
     container_name: caddy
     restart: unless-stopped
     network_mode: host

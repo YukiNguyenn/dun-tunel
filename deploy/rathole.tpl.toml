@@ -21,6 +21,11 @@ default_token = "PLACEHOLDER_DO_NOT_USE"
 [server.transport]
 type = "tcp"
 
+# Bắt buộc phải có block `services` (dù rỗng) — rathole refuse khởi
+# động nếu thiếu. edge-rathole-bridge merge các
+# [server.services.<session_id>] vào đây khi provision tunnel.
+[server.services]
+
 # ─── Phase 4 production TLS (commented out) ──────────────────
 # [server.transport]
 # type = "tls"
