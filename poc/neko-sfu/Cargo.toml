@@ -1,0 +1,53 @@
+# Standalone Cargo manifest for the Phase 0 PoC.
+# IMPORTANT: explicit empty `[workspace]` table prevents cargo from auto-inheriting
+# the parent `dun-tunel/Cargo.toml` workspace. Spike crate stays isolated.
+
+[package]
+name = "neko-sfu-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "sfu_main"
+path = "src/bin/sfu_main.rs"
+
+[dependencies]
+# async runtime + actix (mirrors upstream mediasoup `echo` example)
+tokio = { version = "1.40", features = ["full"] }
+actix = "0.13"
+actix-web = "4.9"
+actix-web-actors = "4.3"
+actix-cors = "0.7"
+env_logger = "0.11"
+
+# webrtc / media (latest stable as of 2026)
+mediasoup = "0.22"
+# Re-exported by mediasoup but we need explicit access to type names that
+# aren't in mediasoup::prelude (SctpParameters, WebRtcMessage).
+mediasoup-types = "0.4"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# logging
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# error / utilities
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# bench / stats (latency histogram for viewer_latency.rs later)
+hdrhistogram = "7"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

@@ -1,0 +1,44 @@
+name: dun-tunel
+
+on:
+  push:
+    paths:
+      - "dun-tunel/**"
+      - ".github/workflows/dun-tunel.yml"
+  pull_request:
+    paths:
+      - "dun-tunel/**"
+      - ".github/workflows/dun-tunel.yml"
+
+jobs:
+  check:
+    name: cargo check + test + clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dun-tunel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dun-tunel -> target
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+      - name: cargo bench (compile only)
+        run: cargo bench --workspace --no-run --all-features

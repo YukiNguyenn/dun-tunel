@@ -1,0 +1,25 @@
+[package]
+name = "edge-sfu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+edge-shared = { path = "../edge-shared" }
+# mediasoup needs Python + Meson + C++ toolchain to build native bindings.
+# On Windows dev, build via WSL2 or skip with: cargo check --workspace --exclude edge-sfu
+# CI builds on Linux where toolchain is available.
+mediasoup.workspace = true
+# Re-exported by mediasoup but explicit access for SctpParameters / Protocol.
+mediasoup-types = "0.4"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+dashmap.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

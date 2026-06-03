@@ -1,0 +1,79 @@
+# Phase 0 PoC — Neko streams via gstreamer UDP RTP into mediasoup PlainTransport.
+#
+# Architecture:
+#   neko (gstreamer) ── UDP RTP pt=96 ──▶  sfu :5004 (PlainTransport)
+#                                                │
+#                                            Router Producer
+#                                                │
+#                                       viewer Consumers (browser)
+#
+# Bring up:  docker compose up -d --build
+# Tear down: docker compose down -v
+
+services:
+  sfu:
+    build:
+      context: .
+      dockerfile: Dockerfile.sfu
+    container_name: poc-sfu
+    restart: "no"
+    ports:
+      - "4443:4443"                          # WS signalling + REST
+      - "40000-40100:40000-40100/udp"        # WebRtcTransport RTP/RTCP for viewers
+      - "5004:5004/udp"                      # PlainTransport RTP from Neko
+      - "5005:5005/udp"                      # PlainTransport RTCP
+    environment:
+      RUST_LOG: "info,mediasoup=info,sfu_main=debug"
+      SFU_LISTEN_HOST: "0.0.0.0"
+      SFU_LISTEN_PORT: "4443"
+      SFU_PUBLIC_IP: "${SFU_PUBLIC_IP:-127.0.0.1}"
+      SFU_RTC_PORT_MIN: "40000"
+      SFU_RTC_PORT_MAX: "40100"
+      SFU_PLAIN_RTP_PORT: "5004"
+      SFU_PLAIN_RTCP_PORT: "5005"
+    networks:
+      default:
+        aliases:
+          - poc-sfu       # Neko's gstreamer udpsink targets this hostname.
+                          # Docker compose only auto-resolves SERVICE name
+                          # ("sfu") between containers; container_name is not
+                          # a DNS alias, so we must declare it explicitly.
+
+  # Neko v3 with mounted config.yaml that defines a custom gstreamer pipeline.
+  # The pipeline tees the encoded VP8 stream into a UDP RTP sink that mediasoup
+  # PlainTransport receives. Native viewer flow on :8080 still works because we
+  # keep the appsink branch.
+  neko:
+    image: m1k1o/neko:firefox
+    container_name: poc-neko
+    restart: "no"
+    shm_size: 2gb
+    ports:
+      - "8080:8080"
+      - "59000-59100:59000-59100/udp"   # Neko's native pion WebRTC EPR range
+    depends_on:
+      - sfu
+    volumes:
+      - ./neko-config.yaml:/etc/neko/neko.yaml:ro
+    environment:
+      NEKO_CONFIG: "/etc/neko/neko.yaml"
+      DISPLAY: ":99"
+      # Enable verbose GStreamer logging to diagnose pipeline buffer flow
+      # for the udpsink branch (PoC-only — high volume, remove for prod).
+      GST_DEBUG: "udpsink:5,rtpvp8pay:4,tee:4,queue:3,vp8enc:3,3"
+    networks:
+      default:
+        aliases:
+          - poc-neko
+
+  # Vite-built spike viewer — Consumer only, auto-fetches the plain producer.
+  viewer:
+    build:
+      context: ./viewer
+      dockerfile: Dockerfile
+    container_name: poc-viewer
+    restart: "no"
+    ports:
+      - "8090:80"
+    depends_on:
+      - sfu

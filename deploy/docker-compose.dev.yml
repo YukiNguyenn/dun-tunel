@@ -1,0 +1,46 @@
+# Dev override — chạy trên Windows/WSL2 không cần host paths /etc /var.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Override:
+#  - Mount paths chuyển sang named volumes (Windows-friendly, không cần
+#    /etc/rathole hoặc /var/lib/dun-tunel tồn tại trên host).
+#  - `network_mode: host` đổi sang bridge với explicit port forwarding
+#    (Windows + Docker Desktop không support host-network theo cách
+#    Linux). Lưu ý: UDP port range cho mediasoup vẫn cần forward thủ
+#    công nếu bạn chạy viewer ngoài Docker network.
+#  - Disable Caddy + rathole nếu chỉ test edge-control isolated.
+
+services:
+  edge-control:
+    network_mode: bridge
+    ports:
+      - "8443:8443"   # edge-control HTTP API
+      - "10000-10100:10000-10100/udp"  # mediasoup ICE (giảm range cho dev)
+    volumes:
+      - rathole_config:/etc/rathole
+      - persistent_queue:/var/lib/dun-tunel/queue
+
+  caddy:
+    network_mode: bridge
+    ports:
+      - "443:443"
+      - "80:80"
+      - "2019:2019"   # admin API for edge-caddy-bridge
+    # Disable DNS-01 wildcard for dev — cần valid Cloudflare zone.
+    # Comment toàn block environment để dùng internal-CA của Caddy
+    # (browser sẽ warning self-signed nhưng đủ cho smoke-test).
+    environment: []
+    profiles: ["full"]
+
+  rathole:
+    network_mode: bridge
+    ports:
+      - "2333:2333"   # rathole control channel
+      - "30000-30100:30000-30100"  # tunnel data ports
+    profiles: ["full"]
+
+volumes:
+  rathole_config:
+  persistent_queue:

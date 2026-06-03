@@ -1,0 +1,59 @@
+# Neko v3 config — overrides default pipeline so the encoded VP8 stream
+# is also forked to a UDP RTP sink that mediasoup PlainTransport receives.
+#
+# Pipeline:
+#   ximagesrc → vp8enc → tee
+#                          ├─→ appsink     (Neko's pion → native viewer on :8080)
+#                          └─→ rtpvp8pay → udpsink (poc-sfu:5004 → mediasoup)
+
+server:
+  bind: ":8080"
+
+session:
+  # Disable cookie auth so the legacy frontend uses URL token instead.
+  # Cookie auth requires same-origin which Docker port-forward breaks.
+  cookie:
+    enabled: false
+
+member:
+  provider: multiuser
+  multiuser:
+    user_password: "neko"
+    admin_password: "admin"
+
+desktop:
+  screen: "1280x720@30"
+
+webrtc:
+  # Force NAT1TO1 to localhost so the browser viewer (running on the host)
+  # can reach Neko's pion via the Docker UDP port-forward 59000-59100.
+  nat1to1: ["127.0.0.1"]
+  epr: "59000-59100"
+
+capture:
+  video:
+    codec: vp8
+    ids: [main]
+    pipelines:
+      main:
+        show_pointer: true
+        gst_pipeline: |
+          ximagesrc display-name=:99 show-pointer=true use-damage=false
+            ! capsfilter caps=video/x-raw,framerate=30/1
+            ! videoconvert
+            ! queue
+            ! vp8enc
+                target-bitrate=2000000
+                cpu-used=4
+                end-usage=cbr
+                threads=4
+                deadline=1
+                keyframe-max-dist=25
+                min-quantizer=4
+                max-quantizer=20
+            ! tee name=t allow-not-linked=true
+            t. ! queue max-size-buffers=10 leaky=downstream ! appsink name=appsink
+            t. ! queue max-size-buffers=10 leaky=downstream
+               ! rtpvp8pay pt=96 ssrc=22222222 mtu=1200
+               ! udpsink host=sfu port=5004 sync=false async=false
+                         buffer-size=2097152

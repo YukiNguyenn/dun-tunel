@@ -1,0 +1,19 @@
+[package]
+name = "edge-callback-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+edge-shared = { path = "../edge-shared" }
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,0 +1,29 @@
+[Unit]
+Description=Rathole tunnel server (dun-tunel edge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rathole
+Group=rathole
+# Server config is rewritten atomically by edge-control via
+# edge-rathole-bridge::ServiceRegistry::persist_and_reload, then SIGHUP
+# is delivered using the pid file path advertised below.
+PIDFile=/run/rathole/rathole.pid
+RuntimeDirectory=rathole
+ExecStartPre=/bin/sh -c 'echo $$$$ > /run/rathole/rathole.pid'
+ExecStart=/usr/local/bin/rathole --server /etc/rathole/server.toml
+# rathole reloads its config when it receives SIGHUP. edge-control
+# triggers this via libc::kill on the pid file we wrote above.
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/rathole
+ReadWritePaths=/run/rathole
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# Rathole server config template.
+# Sections [services.{session_id}] are written by edge-rathole-bridge dynamically.
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "PLACEHOLDER_DO_NOT_USE"  # actual tokens injected per service
+
+[server.transport]
+type = "tls"
+
+[server.transport.tls]
+pkcs12 = "/etc/rathole/server.p12"
+pkcs12_password = "PLACEHOLDER"

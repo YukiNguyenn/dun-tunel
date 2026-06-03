@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Phase 0 PoC — Neko-via-SFU viewer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <h1>Phase 0 PoC — Neko-via-SFU viewer</h1>
+
+    <p>
+      SFU base URL:
+      <input id="sfu-url" value="http://127.0.0.1:4443" size="40" />
+      <button id="connect">connect &amp; consume</button>
+    </p>
+
+    <div class="row">
+      <div class="col">
+        <h3>Remote (Neko stream via mediasoup)</h3>
+        <video id="remote" autoplay playsinline muted></video>
+      </div>
+    </div>
+
+    <h3>Log</h3>
+    <pre id="log"></pre>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,21 @@
+[Unit]
+Description=Dun Tunel edge-control
+After=network-online.target caddy.service rathole.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edge
+Group=edge
+EnvironmentFile=/etc/dun-tunel/edge-control.env
+ExecStart=/usr/local/bin/edge-control
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dun-tunel
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

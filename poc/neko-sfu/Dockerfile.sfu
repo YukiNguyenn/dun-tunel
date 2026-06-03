@@ -1,0 +1,44 @@
+# Builds the mediasoup-rust echo SFU spike binary.
+# cargo-chef setup gives us a stable dependency layer: when only src/* changes,
+# the heavy `cargo build` of mediasoup-sys + actix etc. is cached.
+
+FROM rust:1.88-bookworm AS chef
+WORKDIR /build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-invoke \
+      meson ninja-build \
+      build-essential cmake pkg-config \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup component add rustfmt \
+ && cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY Cargo.toml ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+# Single codegen unit avoids rustfmt parallel pipe pressure during mediasoup-sys build.
+ENV CARGO_BUILD_JOBS=2
+# BuildKit cache mounts persist registry + git deps across builds.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo chef cook --release --recipe-path recipe.json
+COPY Cargo.toml ./
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin sfu_main \
+ && cp /build/target/release/sfu_main /tmp/sfu_main
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /tmp/sfu_main /usr/local/bin/sfu_main
+ENTRYPOINT ["/usr/local/bin/sfu_main"]

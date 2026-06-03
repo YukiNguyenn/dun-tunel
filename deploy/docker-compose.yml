@@ -1,0 +1,58 @@
+version: "3.9"
+
+# Edge_Server stack per region. Deploy 1 instance per VPS.
+# Set REGION_ID env when launching: REGION_ID=sin docker compose up -d
+
+services:
+  edge-control:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: dun-tunel/edge-control:latest
+    container_name: edge-control
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      REGION_ID: ${REGION_ID:?REGION_ID required}
+      EDGE_BIND_PORT: "8443"
+      DUN_API_ENDPOINT: ${DUN_API_ENDPOINT:?DUN_API_ENDPOINT required}
+      DUN_API_KEY: ${DUN_API_KEY:?DUN_API_KEY required}
+      CADDY_ADMIN_URL: "http://127.0.0.1:2019"
+      RATHOLE_CONFIG_PATH: "/etc/rathole/server.toml"
+      PERSISTENT_QUEUE_DIR: "/var/lib/dun-tunel/queue"
+      TUNNEL_JWT_SECRET_V1: ${TUNNEL_JWT_SECRET_V1:-}
+      TUNNEL_JWT_SECRET_V2: ${TUNNEL_JWT_SECRET_V2:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - /etc/rathole:/etc/rathole:ro
+      - /var/lib/dun-tunel/queue:/var/lib/dun-tunel/queue
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN required}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  rathole:
+    image: rapiz1/rathole:latest
+    container_name: rathole-server
+    restart: unless-stopped
+    network_mode: host
+    command: ["--server", "/etc/rathole/server.toml"]
+    volumes:
+      - /etc/rathole:/etc/rathole:ro
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / puppeteer
+node_modules/
+
+# Local env files
+.env
+.env.local
+
+# Docker volumes spawned by docker-compose
+data/
+volumes/
+
+# Logs and benchmark dumps
+*.log
+*.json.gz
+bench-results/
+
+# OS junk
+.DS_Store

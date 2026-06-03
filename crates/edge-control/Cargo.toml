@@ -1,0 +1,32 @@
+[package]
+name = "edge-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "edge-control"
+path = "src/main.rs"
+
+[dependencies]
+edge-shared = { path = "../edge-shared" }
+edge-sfu = { path = "../edge-sfu" }
+edge-rathole-bridge = { path = "../edge-rathole-bridge" }
+edge-caddy-bridge = { path = "../edge-caddy-bridge" }
+edge-bandwidth = { path = "../edge-bandwidth" }
+edge-callback-client = { path = "../edge-callback-client" }
+
+tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
