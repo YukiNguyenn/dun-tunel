@@ -1,13 +1,30 @@
-# Rathole server config template.
-# Sections [services.{session_id}] are written by edge-rathole-bridge dynamically.
+# Rathole server config — Phase 1 development baseline.
+#
+# Sections [server.services.<session_id>] được ghi động bởi
+# edge-rathole-bridge khi provision tunnel. File này là baseline mà
+# bridge merge thêm services vào.
+#
+# Phase 1: transport = "tcp" plain. Auth qua per-service token
+# (Tunnel_Token JWT do dun-api sign), KHÔNG có TLS layer ở rathole.
+# Lý do: client-side traffic đã encrypt qua viewer cookie (Caddy
+# terminate TLS); rathole channel chỉ vận chuyển đã-encrypted-data
+# về upstream Neko_Server. Threat model alpha chấp nhận trade-off
+# này để giảm operator burden (không cần PKCS12 cert chain).
+#
+# Phase 4 GA: bật TLS qua block dưới (uncomment) + provision PKCS12
+# từ Caddy-issued cert chain cho hostname tunnel.<region>.<domain>.
 
 [server]
 bind_addr = "0.0.0.0:2333"
-default_token = "PLACEHOLDER_DO_NOT_USE"  # actual tokens injected per service
+default_token = "PLACEHOLDER_DO_NOT_USE"
 
 [server.transport]
-type = "tls"
+type = "tcp"
 
-[server.transport.tls]
-pkcs12 = "/etc/rathole/server.p12"
-pkcs12_password = "PLACEHOLDER"
+# ─── Phase 4 production TLS (commented out) ──────────────────
+# [server.transport]
+# type = "tls"
+#
+# [server.transport.tls]
+# pkcs12 = "/state/rathole/server.p12"
+# pkcs12_password = "REPLACE_WITH_PKCS12_PASSWORD"
