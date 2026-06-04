@@ -11,7 +11,10 @@
 #
 # Inputs (env):
 #   EDGE_HOST       — host to probe (default 127.0.0.1)
-#   EDGE_PORT       — default 8443
+#   EDGE_PORT       — default 9443 (edge-control direct, NOT Caddy 8443).
+#                     Smoke runs on the host loopback so we bypass Caddy
+#                     and hit edge-control's plain-HTTP admin port. Caddy
+#                     terminates TLS for external traffic.
 #   DUN_API_KEY     — same key edge-control reads from env
 #   CADDY_ADMIN_URL — default http://127.0.0.1:2019
 #   REGION_ID       — default sin
@@ -24,7 +27,7 @@
 set -euo pipefail
 
 EDGE_HOST="${EDGE_HOST:-127.0.0.1}"
-EDGE_PORT="${EDGE_PORT:-8443}"
+EDGE_PORT="${EDGE_PORT:-9443}"
 EDGE_BASE="http://${EDGE_HOST}:${EDGE_PORT}"
 CADDY_ADMIN_URL="${CADDY_ADMIN_URL:-http://127.0.0.1:2019}"
 REGION_ID="${REGION_ID:-sin}"
