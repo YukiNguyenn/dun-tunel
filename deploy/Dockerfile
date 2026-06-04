@@ -35,11 +35,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo clean -p edge-bandwidth -p edge-control \
     && cargo build --release -p edge-control --bin edge-control \
-    && cp /build/target/release/edge-control /usr/local/bin/edge-control \
-    && find /build/target/release -name 'mediasoup-worker' -type f -executable \
-         -exec cp {} /usr/local/bin/mediasoup-worker \; \
-    && test -x /usr/local/bin/mediasoup-worker \
-       || (echo "ERROR: mediasoup-worker not found in target/" && exit 1)
+    && cp /build/target/release/edge-control /usr/local/bin/edge-control
 
 # Runtime stage — slim Debian
 FROM debian:bookworm-slim
@@ -51,12 +47,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/edge-control /usr/local/bin/edge-control
-# mediasoup spawn child process `mediasoup-worker` ở runtime. Binary
-# này build cùng cargo target và copy ra `/usr/local/bin/` ở stage
-# builder để runtime stage thấy được (BuildKit cache mount target/
-# không persist giữa stages).
-COPY --from=builder /usr/local/bin/mediasoup-worker /usr/local/bin/mediasoup-worker
-ENV MEDIASOUP_WORKER_BIN=/usr/local/bin/mediasoup-worker
 
 # Pin UID/GID = 1500 để host bind-mount chown thuận tiện
 # (`sudo chown -R 1500:1500 ../state` trên host).
