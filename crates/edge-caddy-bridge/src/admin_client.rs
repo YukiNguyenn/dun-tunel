@@ -162,30 +162,33 @@ impl AdminClient {
         // when the Caddyfile produced no srv0 site blocks (because we
         // moved api/edge into admin-API-only routes) or an operator
         // ran `DELETE /config/apps/http/servers/srv0/routes` to wipe
-        // the array. Caddy treats POST against a non-existent
-        // collection path as "create the array with this entry".
+        // the array. Use PUT with the full array as the body — PUT
+        // semantics in Caddy admin API create the value at the path
+        // when missing, or replace it when present. POST against a
+        // non-existent collection path fails because POST appends to
+        // an existing slice.
         if routes_status.as_u16() == 404 {
-            let post_resp = self
+            let put_resp = self
                 .inner
                 .http
-                .post(&routes_url)
+                .put(&routes_url)
                 .json(&serde_json::Value::Array(vec![body]))
                 .send()
                 .await
                 .map_err(|e| EdgeError::Config(format!("caddy create routes: {e}")))?;
-            let post_status = post_resp.status();
-            if !post_status.is_success() {
-                let body_text = post_resp.text().await.unwrap_or_default();
+            let put_status = put_resp.status();
+            if !put_status.is_success() {
+                let body_text = put_resp.text().await.unwrap_or_default();
                 return Err(EdgeError::Config(format!(
                     "caddy create routes failed (server={server_name}): \
-                     status={post_status} body={body_text}"
+                     status={put_status} body={body_text}"
                 )));
             }
             tracing::info!(
                 %server_name,
                 host = %route.host,
                 %id,
-                "caddy add_route: POST /routes (created from empty) ok"
+                "caddy add_route: PUT /routes (created from empty) ok"
             );
             self.inner.routes.insert(route.host.clone(), route);
             return self.verify_route_present(&id).await;
