@@ -39,28 +39,45 @@ impl AdminClient {
         }
     }
 
-    /// Idempotent upsert. Try PUT to `/id/<route_id>` first; nếu route
-    /// chưa tồn tại Caddy trả 404 → fallback POST vào array routes của
-    /// server để insert mới. Lần sau gọi cho cùng host sẽ PUT thành công.
-    /// Đây là pattern chuẩn của Caddy admin API cho `@id`-managed objects.
+    /// Idempotent upsert.
+    ///
+    /// Strategy (deterministic, easy to verify, no Caddy admin API
+    /// quirks):
+    ///
+    ///   1. PUT `/id/<route_id>` — fast path when route already exists
+    ///      (re-share same subdomain on TTL refresh).
+    ///   2. On 404: GET full `srv0.routes` array, prepend our new
+    ///      route, PATCH the whole array back. PATCH semantics replace
+    ///      the value at the path.
+    ///   3. Verify by `GET /id/<route_id>` — Caddy returns the route
+    ///      JSON when the `@id` is registered. If verify fails we
+    ///      surface a clear error rather than reporting "ok" while
+    ///      the route silently went missing.
+    ///
+    /// Why not just `POST /routes/0`? In our deployment that path
+    /// returned 200 but the route did not land (auto-restart race or
+    /// silent rollback when the request body shape didn't match what
+    /// the auto-saved config expected). PATCH-with-full-array gives
+    /// us an explicit before/after snapshot we can verify.
     pub async fn add_route(&self, route: CaddyRoute) -> EdgeResult<()> {
         let id = route_id(&route.host);
         let body = build_route(&route);
 
-        // Attempt 1: PUT /id/<route_id> for in-place update
-        let put_url = format!("{}/id/{}", self.inner.base_url, id);
+        // Attempt 1: PUT /id/<route_id> for in-place update.
+        let id_url = format!("{}/id/{}", self.inner.base_url, id);
         let resp = self
             .inner
             .http
-            .put(&put_url)
+            .put(&id_url)
             .json(&body)
             .send()
             .await
             .map_err(|e| EdgeError::Config(format!("caddy put route: {e}")))?;
         let status = resp.status();
         if status.is_success() {
+            tracing::info!(host = %route.host, %id, "caddy add_route: PUT /id ok");
             self.inner.routes.insert(route.host.clone(), route);
-            return Ok(());
+            return self.verify_route_present(&id).await;
         }
         if status.as_u16() != 404 {
             let body_text = resp.text().await.unwrap_or_default();
@@ -69,54 +86,80 @@ impl AdminClient {
             )));
         }
 
-        // Attempt 2: route chưa tồn tại → POST vào routes array của
-        // server đầu tiên Caddy generate. Tên server thường là `srv0`
-        // nhưng có thể khác nên fetch list và pick first.
-        //
-        // ── ORDER MATTERS ──
-        // The Caddyfile (deploy/Caddyfile.tpl) declares
-        // `*.<region>.<domain>:8443 { respond 404 }` as the wildcard
-        // catch-all site block. Caddyfile adaptation puts that block
-        // into `srv0.routes` with `terminal: true`, so any append
-        // (`POST /routes/...`) lands AFTER the catch-all and never
-        // matches. We must **PREPEND** dynamic routes via
-        // `POST /routes/0` so per-session subdomain routes are
-        // evaluated before the wildcard 404. The catch-all only
-        // fires when no dynamic route owns the host — exactly the
-        // intended fall-through behaviour.
+        // Attempt 2: route is brand new. Fetch the routes array,
+        // prepend our entry, PATCH it back. We avoid POST /routes/0
+        // because in-the-wild it returned 200 without persisting.
         let server_name = self.first_server_name().await?;
-        let post_url = format!(
-            "{}/config/apps/http/servers/{}/routes/0",
+        let routes_url = format!(
+            "{}/config/apps/http/servers/{}/routes",
             self.inner.base_url, server_name
         );
-        let resp = self
+
+        let existing: serde_json::Value = self
             .inner
             .http
-            .post(&post_url)
-            .json(&body)
+            .get(&routes_url)
             .send()
             .await
-            .map_err(|e| EdgeError::Config(format!("caddy post route: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
+            .map_err(|e| EdgeError::Config(format!("caddy fetch routes: {e}")))?
+            .json()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy fetch routes parse: {e}")))?;
+
+        let mut arr = existing
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        arr.insert(0, body);
+
+        let patch_resp = self
+            .inner
+            .http
+            .patch(&routes_url)
+            .json(&arr)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy patch routes: {e}")))?;
+        let patch_status = patch_resp.status();
+        if !patch_status.is_success() {
+            let body_text = patch_resp.text().await.unwrap_or_default();
             return Err(EdgeError::Config(format!(
-                "caddy post route failed (server={server_name}): status={status} body={body_text}"
+                "caddy patch routes failed (server={server_name}): \
+                 status={patch_status} body={body_text}"
             )));
         }
-        // Caddy returns 200 with empty body on success. Log explicitly so
-        // operators can confirm the upsert reached Caddy when debugging
-        // "route exists in code but URL 404s" issues — admin API auto-
-        // restarts the HTTP listener after every config change so we lose
-        // sight of which mutation took effect without explicit logging.
+
         tracing::info!(
             %server_name,
             host = %route.host,
             %id,
-            "caddy add_route: POST /routes/0 (prepended) ok"
+            new_routes_len = arr.len(),
+            "caddy add_route: PATCH /routes (prepended) ok"
         );
         self.inner.routes.insert(route.host.clone(), route);
-        Ok(())
+        self.verify_route_present(&id).await
+    }
+
+    /// Confirm the route landed by querying Caddy's `@id` index.
+    /// If the route is not visible after a successful add, surface
+    /// an error so callers can roll back the share session instead of
+    /// claiming success while the viewer URL goes to 404.
+    async fn verify_route_present(&self, id: &str) -> EdgeResult<()> {
+        let url = format!("{}/id/{}", self.inner.base_url, id);
+        let resp = self
+            .inner
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy verify route: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(EdgeError::Config(format!(
+            "caddy verify route '{id}' missing after add: status={status}"
+        )))
     }
 
     /// Pick first HTTP server name từ Caddy config. Dùng để `POST

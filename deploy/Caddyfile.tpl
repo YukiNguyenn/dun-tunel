@@ -47,20 +47,15 @@ edge.{{REGION}}.{{DOMAIN}}:8443 {
     reverse_proxy 127.0.0.1:9443
 }
 
-# ─── viewer wildcard — dynamic routes injected by edge-caddy-bridge ─
-*.{{REGION}}.{{DOMAIN}}:8443 {
-    tls {
-        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
-    }
-
-    # edge-caddy-bridge POST các route entry vào array `routes` của
-    # server `srv0` qua admin API (path `/config/apps/http/servers/srv0/routes/...`).
-    # Routes match theo Host (subdomain) → reverse_proxy upstream
-    # `127.0.0.1:<dynamic-port>` mà rathole gán per session.
-    #
-    # Catch-all dưới đây chạy SAU dynamic routes (Caddy match theo
-    # thứ tự routes array; static block trong Caddyfile được expand
-    # thành route entries cuối array). Tunnel chưa có session →
-    # match catch-all → 404.
-    respond 404
-}
+# ─── Wildcard cert automation ───────────────────────────────────
+#
+# We DO NOT declare a `*.{{REGION}}.{{DOMAIN}}:8443` site block here:
+# the Caddyfile adapter would emit it as a `srv0.routes` entry with
+# `terminal: true`, and the route ordering (dynamic routes appended
+# after Caddyfile-declared blocks) means the wildcard would shadow
+# every per-session subdomain — viewer URLs would always 404.
+#
+# Instead, edge-control posts a `tls.automation.policies` entry via
+# the admin API at startup so Caddy still issues the wildcard cert
+# via the cloudflare DNS challenge. See `edge-caddy-bridge::AdminClient
+# ::ensure_wildcard_tls_policy`.
