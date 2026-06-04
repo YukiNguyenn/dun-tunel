@@ -72,16 +72,28 @@ impl AdminClient {
         // Attempt 2: route chưa tồn tại → POST vào routes array của
         // server đầu tiên Caddy generate. Tên server thường là `srv0`
         // nhưng có thể khác nên fetch list và pick first.
+        //
+        // ── ORDER MATTERS ──
+        // The Caddyfile (deploy/Caddyfile.tpl) declares
+        // `*.<region>.<domain>:8443 { respond 404 }` as the wildcard
+        // catch-all site block. Caddyfile adaptation puts that block
+        // into `srv0.routes` with `terminal: true`, so any append
+        // (`POST /routes/...`) lands AFTER the catch-all and never
+        // matches. We must **PREPEND** dynamic routes via
+        // `POST /routes/0` so per-session subdomain routes are
+        // evaluated before the wildcard 404. The catch-all only
+        // fires when no dynamic route owns the host — exactly the
+        // intended fall-through behaviour.
         let server_name = self.first_server_name().await?;
         let post_url = format!(
-            "{}/config/apps/http/servers/{}/routes/...",
+            "{}/config/apps/http/servers/{}/routes/0",
             self.inner.base_url, server_name
         );
         let resp = self
             .inner
             .http
             .post(&post_url)
-            .json(&serde_json::json!([body]))
+            .json(&body)
             .send()
             .await
             .map_err(|e| EdgeError::Config(format!("caddy post route: {e}")))?;
@@ -92,6 +104,17 @@ impl AdminClient {
                 "caddy post route failed (server={server_name}): status={status} body={body_text}"
             )));
         }
+        // Caddy returns 200 with empty body on success. Log explicitly so
+        // operators can confirm the upsert reached Caddy when debugging
+        // "route exists in code but URL 404s" issues — admin API auto-
+        // restarts the HTTP listener after every config change so we lose
+        // sight of which mutation took effect without explicit logging.
+        tracing::info!(
+            %server_name,
+            host = %route.host,
+            %id,
+            "caddy add_route: POST /routes/0 (prepended) ok"
+        );
         self.inner.routes.insert(route.host.clone(), route);
         Ok(())
     }

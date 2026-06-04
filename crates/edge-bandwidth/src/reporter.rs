@@ -1,4 +1,11 @@
-﻿//! 60-second bandwidth reporter loop.
+//! 60-second bandwidth reporter loop.
+//! Per session: track cumulative_bytes, next_sequence, last_reported_at.
+//! Skip delta < 0.1 MB to reduce noise.
+//!
+//! Restart safety (R3.5): the next-sequence counter is bootstrapped
+//! from disk via `SequenceStore::load_all` and persisted after every
+//! successful callback send. A crash between send and persist replays
+//! the same sequence — dun-api dedupes.
 
 use crate::persistence::SequenceStore;
 use chrono::{DateTime, Utc};
