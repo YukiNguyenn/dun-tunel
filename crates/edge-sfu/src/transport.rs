@@ -14,8 +14,20 @@ use std::num::NonZeroU32;
 const DEFAULT_RTC_MIN_PORT: u16 = 50_000;
 const DEFAULT_RTC_MAX_PORT: u16 = 60_000;
 
-const DEFAULT_PLAIN_RTP_PORT: u16 = 5004;
-const DEFAULT_PLAIN_RTCP_PORT: u16 = 5005;
+/// PlainTransport per-session port pool (R8.1).
+///
+/// Each ShareSession provisions its own PlainTransport for the Neko →
+/// SFU GStreamer pipeline. Mediasoup binds an exclusive UDP port per
+/// transport so we MUST give it a range to pick from — using a single
+/// fixed port causes the second concurrent session to fail with
+/// `uv_udp_bind() failed: address already in use` (observed on
+/// 2026-06-04 after smoke #1 left a lingering bind).
+///
+/// Range chosen to sit between conventional VoIP ports (5004 was the
+/// PoC default) and the WebRTC ephemeral range (50000+). 100 ports is
+/// 50× headroom over our viewer-cap target so we never run out.
+const DEFAULT_PLAIN_RTP_MIN_PORT: u16 = 5_000;
+const DEFAULT_PLAIN_RTP_MAX_PORT: u16 = 5_099;
 
 const PLAIN_PAYLOAD_TYPE: u8 = 96;
 const PLAIN_CLOCK_RATE: u32 = 90_000;
@@ -27,8 +39,11 @@ pub struct RouterListenInfo {
     pub announced_ip: IpAddr,
     pub rtc_min_port: u16,
     pub rtc_max_port: u16,
-    pub plain_rtp_port: u16,
-    pub plain_rtcp_port: u16,
+    /// Lower bound of the per-session PlainTransport UDP port range.
+    /// Mediasoup picks an unused port from `[plain_min..=plain_max]`
+    /// per `create_plain_transport`.
+    pub plain_rtp_min_port: u16,
+    pub plain_rtp_max_port: u16,
 }
 
 impl RouterListenInfo {
@@ -38,11 +53,16 @@ impl RouterListenInfo {
         let announced_ip = env_ip("SFU_ANNOUNCED_IP", "127.0.0.1")?;
         let rtc_min_port = env_u16("SFU_RTC_MIN_PORT", DEFAULT_RTC_MIN_PORT)?;
         let rtc_max_port = env_u16("SFU_RTC_MAX_PORT", DEFAULT_RTC_MAX_PORT)?;
-        let plain_rtp_port = env_u16("SFU_PLAIN_RTP_PORT", DEFAULT_PLAIN_RTP_PORT)?;
-        let plain_rtcp_port = env_u16("SFU_PLAIN_RTCP_PORT", DEFAULT_PLAIN_RTCP_PORT)?;
+        let plain_rtp_min_port = env_u16("SFU_PLAIN_RTP_MIN_PORT", DEFAULT_PLAIN_RTP_MIN_PORT)?;
+        let plain_rtp_max_port = env_u16("SFU_PLAIN_RTP_MAX_PORT", DEFAULT_PLAIN_RTP_MAX_PORT)?;
         if rtc_min_port >= rtc_max_port {
             anyhow::bail!(
                 "SFU_RTC_MIN_PORT ({rtc_min_port}) must be < SFU_RTC_MAX_PORT ({rtc_max_port})"
+            );
+        }
+        if plain_rtp_min_port >= plain_rtp_max_port {
+            anyhow::bail!(
+                "SFU_PLAIN_RTP_MIN_PORT ({plain_rtp_min_port}) must be < SFU_PLAIN_RTP_MAX_PORT ({plain_rtp_max_port})"
             );
         }
         Ok(Self {
@@ -50,8 +70,8 @@ impl RouterListenInfo {
             announced_ip,
             rtc_min_port,
             rtc_max_port,
-            plain_rtp_port,
-            plain_rtcp_port,
+            plain_rtp_min_port,
+            plain_rtp_max_port,
         })
     }
 }
@@ -65,8 +85,11 @@ pub fn create_plain_transport_options(listen: &RouterListenInfo) -> PlainTranspo
         ip: listen.listen_ip,
         announced_address: Some(listen.announced_ip.to_string()),
         expose_internal_ip: false,
-        port: Some(listen.plain_rtp_port),
-        port_range: None,
+        // `port: None` + `port_range`: mediasoup picks a free UDP port
+        // per session. Required for ≥ 2 concurrent sessions; previously
+        // we hard-coded 5004 and the second session hit `EADDRINUSE`.
+        port: None,
+        port_range: Some(listen.plain_rtp_min_port..=listen.plain_rtp_max_port),
         flags: None,
         send_buffer_size: None,
         recv_buffer_size: None,
