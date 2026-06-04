@@ -47,6 +47,36 @@ impl AppState {
         let rathole = ServiceRegistry::new(cfg.rathole_config_path.clone());
         let port_allocator = Arc::new(PortAllocator::new());
         let caddy = AdminClient::new(cfg.caddy_admin_url.clone());
+
+        // Bootstrap the wildcard TLS policy when both domain + CF
+        // token are configured. This replaces the `*.<region>.<domain>:8443`
+        // site block that used to live in `Caddyfile.tpl` — that
+        // block was removed because the Caddyfile adapter emitted
+        // it as a `terminal: true` route entry that shadowed every
+        // dynamic per-session route, breaking viewer URLs with 404.
+        // Without the policy here Caddy would still serve dynamic
+        // routes but couldn't auto-issue the wildcard cert.
+        match (&cfg.share_tunnel_domain, &cfg.cloudflare_api_token) {
+            (Some(domain), Some(token)) => {
+                if let Err(e) = caddy
+                    .ensure_wildcard_tls_policy(&cfg.region, domain, token)
+                    .await
+                {
+                    tracing::warn!(
+                        error = ?e,
+                        region = %cfg.region,
+                        domain = %domain,
+                        "ensure_wildcard_tls_policy failed; viewer subdomains will use untrusted cert until next retry"
+                    );
+                }
+            }
+            (Some(_), None) => tracing::warn!(
+                "SHARE_TUNNEL_DOMAIN set but CLOUDFLARE_API_TOKEN missing — wildcard cert will NOT auto-renew"
+            ),
+            (None, _) => tracing::warn!(
+                "SHARE_TUNNEL_DOMAIN not set — wildcard TLS policy bootstrap skipped (dev mode only)"
+            ),
+        }
         let callback = CallbackClient::new(
             cfg.dun_api_endpoint.clone(),
             cfg.mtls_cert_path.clone(),

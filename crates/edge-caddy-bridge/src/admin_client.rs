@@ -10,6 +10,7 @@ use crate::route_builder::{build_route, route_id};
 use dashmap::DashMap;
 use edge_shared::errors::{EdgeError, EdgeResult};
 use edge_shared::types::CaddyRoute;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,10 +107,18 @@ impl AdminClient {
             .await
             .map_err(|e| EdgeError::Config(format!("caddy fetch routes parse: {e}")))?;
 
-        let mut arr = existing
+        // Filter out `null` entries that legacy DELETE-by-index calls
+        // can leave behind (Caddy doesn't always shrink the array; it
+        // sets the slot to `null`). Including them in the PATCH would
+        // re-persist the holes — harmless to routing but noisy in
+        // dumps and they slowly accumulate over time.
+        let mut arr: Vec<serde_json::Value> = existing
             .as_array()
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| !v.is_null())
+            .collect();
         arr.insert(0, body);
 
         let patch_resp = self
@@ -301,6 +310,157 @@ impl AdminClient {
     /// Returns local cached view; used by snapshot reconciliation (R22).
     pub async fn list_routes(&self) -> Vec<CaddyRoute> {
         self.inner.routes.iter().map(|e| e.value().clone()).collect()
+    }
+
+    /// Bootstrap a TLS automation policy that issues the wildcard
+    /// `*.<region>.<domain>` cert via Cloudflare DNS challenge.
+    ///
+    /// Why this is needed: we removed the
+    /// `*.<region>.<domain>:8443 { tls { dns cloudflare ... } }`
+    /// site block from `Caddyfile.tpl` because the Caddyfile adapter
+    /// emitted it as a `srv0.routes` entry with `terminal: true`,
+    /// which shadowed every dynamic per-session subdomain (404 for
+    /// every viewer URL). Without that site block, Caddy still needs
+    /// some hint to obtain the wildcard cert via the DNS-01 challenge
+    /// — that hint comes from the TLS automation policy installed
+    /// here at edge-control startup.
+    ///
+    /// Idempotent: PUT `/id/dun-tunel-wildcard-tls` overwrites the
+    /// existing entry on every call so a config drift never leaves
+    /// stale policies behind.
+    pub async fn ensure_wildcard_tls_policy(
+        &self,
+        region: &str,
+        domain: &str,
+        cloudflare_api_token: &str,
+    ) -> EdgeResult<()> {
+        let policy_id = "dun-tunel-wildcard-tls";
+        let wildcard_subject = format!("*.{}.{}", region, domain);
+
+        // Caddy 2.x policy shape:
+        //   {
+        //     "subjects": ["*.sin.dun-studio.xyz"],
+        //     "issuers": [{
+        //       "module": "acme",
+        //       "challenges": {
+        //         "dns": {
+        //           "provider": {
+        //             "name": "cloudflare",
+        //             "api_token": "<token>"
+        //           }
+        //         }
+        //       }
+        //     }]
+        //   }
+        let policy = json!({
+            "@id": policy_id,
+            "subjects": [wildcard_subject],
+            "issuers": [{
+                "module": "acme",
+                "challenges": {
+                    "dns": {
+                        "provider": {
+                            "name": "cloudflare",
+                            "api_token": cloudflare_api_token,
+                        }
+                    }
+                }
+            }]
+        });
+
+        // Try @id PUT first — cheapest path on subsequent restarts.
+        let id_url = format!("{}/id/{}", self.inner.base_url, policy_id);
+        let resp = self
+            .inner
+            .http
+            .put(&id_url)
+            .json(&policy)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy put tls policy: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            tracing::info!(%wildcard_subject, "caddy ensure_wildcard_tls_policy: PUT /id ok");
+            return Ok(());
+        }
+        if status.as_u16() != 404 {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(EdgeError::Config(format!(
+                "caddy put tls policy failed: status={status} body={body}"
+            )));
+        }
+
+        // 404 means the @id is unknown — we need to create the
+        // policies array (or append into it). Caddy stores policies
+        // at `/config/apps/tls/automation/policies`. Probe the array
+        // first; if it is missing entirely we PATCH a new array,
+        // otherwise prepend our entry.
+        let policies_url = format!(
+            "{}/config/apps/tls/automation/policies",
+            self.inner.base_url
+        );
+        let probe = self
+            .inner
+            .http
+            .get(&policies_url)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy get tls policies: {e}")))?;
+        let probe_status = probe.status();
+
+        if probe_status.is_success() {
+            let existing: serde_json::Value = probe
+                .json()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy tls policies parse: {e}")))?;
+            let mut arr = existing.as_array().cloned().unwrap_or_default();
+            arr.insert(0, policy);
+            let patch = self
+                .inner
+                .http
+                .patch(&policies_url)
+                .json(&arr)
+                .send()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy patch tls policies: {e}")))?;
+            let patch_status = patch.status();
+            if !patch_status.is_success() {
+                let body = patch.text().await.unwrap_or_default();
+                return Err(EdgeError::Config(format!(
+                    "caddy patch tls policies failed: status={patch_status} body={body}"
+                )));
+            }
+        } else {
+            // Either /apps/tls or /apps/tls/automation does not exist
+            // yet (Caddy started with no tls block at all). Create
+            // the full path with a single policy. Caddy POST-with-
+            // path-creation accepts nested missing paths via PATCH
+            // on the parent.
+            let automation_url =
+                format!("{}/config/apps/tls/automation", self.inner.base_url);
+            let body = json!({ "policies": [policy] });
+            let patch = self
+                .inner
+                .http
+                .patch(&automation_url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy patch tls automation: {e}")))?;
+            let patch_status = patch.status();
+            if !patch_status.is_success() {
+                let body = patch.text().await.unwrap_or_default();
+                return Err(EdgeError::Config(format!(
+                    "caddy patch tls automation failed: status={patch_status} body={body}"
+                )));
+            }
+        }
+
+        tracing::info!(
+            %wildcard_subject,
+            "caddy ensure_wildcard_tls_policy: bootstrapped policies array"
+        );
+        Ok(())
     }
 }
 

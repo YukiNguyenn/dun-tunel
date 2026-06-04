@@ -24,12 +24,24 @@ pub async fn create(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    // 2. Register rathole service
+    // 2. Register rathole service.
+    //
+    // Rathole shared secret is the RAW jwt bytes — not the sha256
+    // hash. dun-app's rathole client writes the same raw JWT to its
+    // own [client.services.<id>] block, and rathole HMAC-compares
+    // wire bytes during handshake. Storing the hash here would
+    // produce a silent mismatch (handshake fails, no client can
+    // bind, Caddy 502s when proxying).
+    //
+    // The hash field is still recorded by dun-api for audit /
+    // revocation lookups; the guard sidecar (verify_tunnel_handler)
+    // re-validates the JWT signature + jti so authority is not
+    // delegated to rathole's byte-equality check alone.
     state
         .rathole
         .register(RatholeService {
             name: req.session_id.clone(),
-            token_hash: req.tunnel_token_hash.clone(),
+            token_hash: req.tunnel_token.clone(),
             bind_addr: format!("0.0.0.0:{local_port}"),
         })
         .await

@@ -19,6 +19,16 @@ pub struct EdgeConfig {
     pub sfu_workers: usize,
     pub jwt_secret_v1: Option<String>,
     pub jwt_secret_v2: Option<String>,
+    /// Root domain for viewer subdomains (e.g. `dun-studio.xyz`).
+    /// Used at startup to bootstrap the Caddy TLS automation policy
+    /// for the `*.<region>.<domain>` wildcard cert. Optional —
+    /// edge-control still works without it but Caddy will not auto-
+    /// renew the wildcard cert.
+    pub share_tunnel_domain: Option<String>,
+    /// Cloudflare API token with DNS:Edit on the share-tunnel zone.
+    /// Required when `share_tunnel_domain` is set so Caddy can
+    /// satisfy the DNS-01 challenge.
+    pub cloudflare_api_token: Option<String>,
 }
 
 impl EdgeConfig {
@@ -52,6 +62,9 @@ impl EdgeConfig {
         let jwt_secret_v1 = std::env::var("TUNNEL_JWT_SECRET_V1").ok();
         let jwt_secret_v2 = std::env::var("TUNNEL_JWT_SECRET_V2").ok();
 
+        let share_tunnel_domain = std::env::var("SHARE_TUNNEL_DOMAIN").ok();
+        let cloudflare_api_token = std::env::var("CLOUDFLARE_API_TOKEN").ok();
+
         Ok(Self {
             region,
             bind_port,
@@ -66,6 +79,8 @@ impl EdgeConfig {
             sfu_workers,
             jwt_secret_v1,
             jwt_secret_v2,
+            share_tunnel_domain,
+            cloudflare_api_token,
         })
     }
 }

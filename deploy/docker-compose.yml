@@ -33,6 +33,11 @@ services:
       PERSISTENT_QUEUE_DIR: "/state/queue"
       TUNNEL_JWT_SECRET_V1: ${TUNNEL_JWT_SECRET_V1:-}
       TUNNEL_JWT_SECRET_V2: ${TUNNEL_JWT_SECRET_V2:-}
+      # Domain + CF token cho edge-control bootstrap wildcard TLS
+      # policy qua Caddy admin API (thay site block cũ trong
+      # Caddyfile.tpl).
+      SHARE_TUNNEL_DOMAIN: ${SHARE_TUNNEL_DOMAIN:?SHARE_TUNNEL_DOMAIN required}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN required}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       # Read-write: bridge rewrite rathole config + persist sequence

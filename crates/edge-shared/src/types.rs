@@ -15,7 +15,19 @@ pub type RegionId = String;
 pub struct CreateSessionReq {
     pub session_id: SessionId,
     pub subdomain: String, // <random16>.<region>.dun-studio.xyz
-    pub tunnel_token_hash: String, // sha256 hex
+    /// SHA-256 hex of the tunnel JWT — kept for storage / audit.
+    /// NOT used as the rathole shared secret because rathole compares
+    /// raw bytes, not the hash; both sides MUST present the same
+    /// raw value (see `tunnel_token`).
+    pub tunnel_token_hash: String,
+    /// Raw plaintext tunnel JWT. This is the shared secret rathole
+    /// uses for the per-service handshake — both sides (edge server
+    /// config + dun-app rathole client) must register the SAME raw
+    /// value. The JWT itself is short-lived (≤ TTL) and the guard
+    /// sidecar separately verifies its signature/jti at handshake
+    /// time, so the wire-bytes match here is purely the auth proof
+    /// rathole expects.
+    pub tunnel_token: String,
     pub viewer_token_hash: String,
     pub codecs: Vec<MediaCodec>,
     pub expires_at: DateTime<Utc>,
