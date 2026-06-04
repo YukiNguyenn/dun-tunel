@@ -50,7 +50,13 @@ impl AdminClient {
     ///   2. On 404: GET full `srv0.routes` array, prepend our new
     ///      route, PATCH the whole array back. PATCH semantics replace
     ///      the value at the path.
-    ///   3. Verify by `GET /id/<route_id>` — Caddy returns the route
+    ///   3. If the `routes` key does not exist on the server (Caddy
+    ///      adapter never emitted it because the Caddyfile contains
+    ///      no `srv0` site blocks, or an operator wiped it), fall
+    ///      back to a `POST /config/apps/http/servers/<srv>/routes`
+    ///      which Caddy treats as "create the array with this single
+    ///      entry".
+    ///   4. Verify by `GET /id/<route_id>` — Caddy returns the route
     ///      JSON when the `@id` is registered. If verify fails we
     ///      surface a clear error rather than reporting "ok" while
     ///      the route silently went missing.
@@ -96,57 +102,100 @@ impl AdminClient {
             self.inner.base_url, server_name
         );
 
-        let existing: serde_json::Value = self
+        let routes_resp = self
             .inner
             .http
             .get(&routes_url)
             .send()
             .await
-            .map_err(|e| EdgeError::Config(format!("caddy fetch routes: {e}")))?
-            .json()
-            .await
-            .map_err(|e| EdgeError::Config(format!("caddy fetch routes parse: {e}")))?;
+            .map_err(|e| EdgeError::Config(format!("caddy fetch routes: {e}")))?;
+        let routes_status = routes_resp.status();
 
-        // Filter out `null` entries that legacy DELETE-by-index calls
-        // can leave behind (Caddy doesn't always shrink the array; it
-        // sets the slot to `null`). Including them in the PATCH would
-        // re-persist the holes — harmless to routing but noisy in
-        // dumps and they slowly accumulate over time.
-        let mut arr: Vec<serde_json::Value> = existing
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|v| !v.is_null())
-            .collect();
-        arr.insert(0, body);
+        if routes_status.is_success() {
+            let existing: serde_json::Value = routes_resp
+                .json()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy fetch routes parse: {e}")))?;
+            // Filter out `null` entries that legacy DELETE-by-index calls
+            // can leave behind (Caddy doesn't always shrink the array; it
+            // sets the slot to `null`). Including them in the PATCH would
+            // re-persist the holes — harmless to routing but noisy in
+            // dumps and they slowly accumulate over time.
+            let mut arr: Vec<serde_json::Value> = existing
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| !v.is_null())
+                .collect();
+            arr.insert(0, body);
 
-        let patch_resp = self
-            .inner
-            .http
-            .patch(&routes_url)
-            .json(&arr)
-            .send()
-            .await
-            .map_err(|e| EdgeError::Config(format!("caddy patch routes: {e}")))?;
-        let patch_status = patch_resp.status();
-        if !patch_status.is_success() {
-            let body_text = patch_resp.text().await.unwrap_or_default();
-            return Err(EdgeError::Config(format!(
-                "caddy patch routes failed (server={server_name}): \
-                 status={patch_status} body={body_text}"
-            )));
+            let patch_resp = self
+                .inner
+                .http
+                .patch(&routes_url)
+                .json(&arr)
+                .send()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy patch routes: {e}")))?;
+            let patch_status = patch_resp.status();
+            if !patch_status.is_success() {
+                let body_text = patch_resp.text().await.unwrap_or_default();
+                return Err(EdgeError::Config(format!(
+                    "caddy patch routes failed (server={server_name}): \
+                     status={patch_status} body={body_text}"
+                )));
+            }
+
+            tracing::info!(
+                %server_name,
+                host = %route.host,
+                %id,
+                new_routes_len = arr.len(),
+                "caddy add_route: PATCH /routes (prepended) ok"
+            );
+            self.inner.routes.insert(route.host.clone(), route);
+            return self.verify_route_present(&id).await;
         }
 
-        tracing::info!(
-            %server_name,
-            host = %route.host,
-            %id,
-            new_routes_len = arr.len(),
-            "caddy add_route: PATCH /routes (prepended) ok"
-        );
-        self.inner.routes.insert(route.host.clone(), route);
-        self.verify_route_present(&id).await
+        // Attempt 3: `routes` key does not exist (404). This happens
+        // when the Caddyfile produced no srv0 site blocks (because we
+        // moved api/edge into admin-API-only routes) or an operator
+        // ran `DELETE /config/apps/http/servers/srv0/routes` to wipe
+        // the array. Caddy treats POST against a non-existent
+        // collection path as "create the array with this entry".
+        if routes_status.as_u16() == 404 {
+            let post_resp = self
+                .inner
+                .http
+                .post(&routes_url)
+                .json(&serde_json::Value::Array(vec![body]))
+                .send()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy create routes: {e}")))?;
+            let post_status = post_resp.status();
+            if !post_status.is_success() {
+                let body_text = post_resp.text().await.unwrap_or_default();
+                return Err(EdgeError::Config(format!(
+                    "caddy create routes failed (server={server_name}): \
+                     status={post_status} body={body_text}"
+                )));
+            }
+            tracing::info!(
+                %server_name,
+                host = %route.host,
+                %id,
+                "caddy add_route: POST /routes (created from empty) ok"
+            );
+            self.inner.routes.insert(route.host.clone(), route);
+            return self.verify_route_present(&id).await;
+        }
+
+        let body_text = routes_resp.text().await.unwrap_or_default();
+        Err(EdgeError::Config(format!(
+            "caddy fetch routes failed (server={server_name}): \
+             status={routes_status} body={body_text}"
+        )))
     }
 
     /// Confirm the route landed by querying Caddy's `@id` index.
@@ -312,6 +361,31 @@ impl AdminClient {
         self.inner.routes.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// Bootstrap the `edge.<region>.<domain>` reverse-proxy route via
+    /// the admin API. We can't declare this in `Caddyfile.tpl` because
+    /// any Caddyfile site block with `tls { dns ... }` produces an
+    /// automation policy whose subject is the explicit host, which
+    /// then conflicts with the wildcard `*.<region>.<domain>` policy
+    /// we install below (Caddy refuses overlapping policies for the
+    /// same host with `cannot apply more than one automation policy`).
+    ///
+    /// Posting the route here keeps the wildcard policy as the single
+    /// source of TLS for everything under `<region>.<domain>`.
+    pub async fn ensure_edge_admin_route(
+        &self,
+        region: &str,
+        domain: &str,
+        upstream_port: u16,
+    ) -> EdgeResult<()> {
+        let host = format!("edge.{}.{}", region, domain);
+        let route = CaddyRoute {
+            host: host.clone(),
+            upstream: format!("127.0.0.1:{upstream_port}"),
+            ws_paths: vec![],
+        };
+        self.add_route(route).await
+    }
+
     /// Bootstrap a TLS automation policy that issues the wildcard
     /// `*.<region>.<domain>` cert via Cloudflare DNS challenge.
     ///
@@ -394,7 +468,18 @@ impl AdminClient {
         // policies array (or append into it). Caddy stores policies
         // at `/config/apps/tls/automation/policies`. Probe the array
         // first; if it is missing entirely we PATCH a new array,
-        // otherwise prepend our entry.
+        // otherwise REPLACE its content with just our wildcard
+        // policy.
+        //
+        // Why replace and not prepend? Caddy refuses configs where
+        // two policies match the same host (`cannot apply more than
+        // one automation policy to host`). Older Caddyfile site
+        // blocks like `edge.<region>.<domain> { tls { ... } }`
+        // generate per-host policies that conflict with our wildcard.
+        // We strip them all and own TLS for the entire `<region>.<domain>`
+        // namespace from edge-control instead. The api.<domain>
+        // site block survives because its host is `api.<domain>`,
+        // outside the wildcard subject.
         let policies_url = format!(
             "{}/config/apps/tls/automation/policies",
             self.inner.base_url
@@ -413,13 +498,24 @@ impl AdminClient {
                 .json()
                 .await
                 .map_err(|e| EdgeError::Config(format!("caddy tls policies parse: {e}")))?;
-            let mut arr = existing.as_array().cloned().unwrap_or_default();
-            arr.insert(0, policy);
+            let arr: Vec<serde_json::Value> = existing
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| !v.is_null())
+                .filter(|v| !policy_subject_overlaps(v, &wildcard_subject))
+                .collect();
+            // Prepend our policy so it has highest priority, after
+            // dropping anything that overlaps (`edge.<region>` host-
+            // specific policies left behind by a stale Caddyfile).
+            let mut merged = vec![policy];
+            merged.extend(arr);
             let patch = self
                 .inner
                 .http
                 .patch(&policies_url)
-                .json(&arr)
+                .json(&merged)
                 .send()
                 .await
                 .map_err(|e| EdgeError::Config(format!("caddy patch tls policies: {e}")))?;
@@ -473,4 +569,57 @@ mod tests {
         let host = "abc123.sin.dun-studio.xyz";
         assert_eq!(route_id(host), route_id(host));
     }
+
+    #[test]
+    fn policy_overlap_detects_explicit_host_under_wildcard() {
+        let policy = serde_json::json!({
+            "subjects": ["edge.sin.dun-studio.xyz"],
+        });
+        assert!(policy_subject_overlaps(&policy, "*.sin.dun-studio.xyz"));
+        assert!(!policy_subject_overlaps(&policy, "*.iad.dun-studio.xyz"));
+        let unrelated = serde_json::json!({
+            "subjects": ["api.dun-studio.xyz"],
+        });
+        assert!(!policy_subject_overlaps(&unrelated, "*.sin.dun-studio.xyz"));
+    }
+
+    #[test]
+    fn policy_overlap_self_matches() {
+        let policy = serde_json::json!({
+            "subjects": ["*.sin.dun-studio.xyz"],
+        });
+        assert!(policy_subject_overlaps(&policy, "*.sin.dun-studio.xyz"));
+    }
+}
+
+/// Whether any subject inside `policy` would conflict with our
+/// wildcard subject. We treat a wildcard like `*.sin.dun-studio.xyz`
+/// as covering every single-label-prefix host under
+/// `sin.dun-studio.xyz`. Two policies with overlapping coverage on
+/// the same host trigger Caddy's `cannot apply more than one
+/// automation policy` error, so we strip them out.
+fn policy_subject_overlaps(policy: &serde_json::Value, wildcard_subject: &str) -> bool {
+    let suffix = match wildcard_subject.strip_prefix("*.") {
+        Some(s) => s,
+        None => return false,
+    };
+    let subjects = match policy.get("subjects").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return false,
+    };
+    subjects.iter().any(|subj| match subj.as_str() {
+        Some(s) if s == wildcard_subject => true,
+        Some(s) => {
+            // Is this an explicit host directly under our wildcard?
+            // `edge.sin.dun-studio.xyz` ends with `.sin.dun-studio.xyz`
+            // and has no `.` between the leading label and the suffix.
+            if let Some(prefix) = s.strip_suffix(suffix) {
+                let prefix = prefix.trim_end_matches('.');
+                !prefix.is_empty() && !prefix.contains('.')
+            } else {
+                false
+            }
+        }
+        None => false,
+    })
 }

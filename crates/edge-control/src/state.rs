@@ -69,6 +69,25 @@ impl AppState {
                         "ensure_wildcard_tls_policy failed; viewer subdomains will use untrusted cert until next retry"
                     );
                 }
+
+                // Register the `edge.<region>.<domain>` reverse-proxy
+                // route via the admin API. Done after the TLS policy
+                // so the wildcard cert is already in flight when the
+                // route comes online (Caddy will obtain on demand
+                // either way; ordering just makes the first request
+                // less likely to race).
+                if let Err(e) = caddy
+                    .ensure_edge_admin_route(&cfg.region, domain, cfg.bind_port)
+                    .await
+                {
+                    tracing::warn!(
+                        error = ?e,
+                        region = %cfg.region,
+                        domain = %domain,
+                        port = cfg.bind_port,
+                        "ensure_edge_admin_route failed; dun-api → edge admin calls will 404 until next retry"
+                    );
+                }
             }
             (Some(_), None) => tracing::warn!(
                 "SHARE_TUNNEL_DOMAIN set but CLOUDFLARE_API_TOKEN missing — wildcard cert will NOT auto-renew"

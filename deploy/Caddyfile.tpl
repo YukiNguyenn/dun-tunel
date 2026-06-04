@@ -36,26 +36,21 @@ api.{{DOMAIN}}:8443 {
     }
 }
 
-# ─── edge-control admin (chỉ dun-api → edge calls) ──────────────
-# KHÔNG khai báo `tls { dns }` riêng — Caddy tự match wildcard cert
-# `*.sin.{{DOMAIN}}` đã obtain ở site block dưới. Tránh obtain cert
-# riêng cho edge.sin (thừa + tốn ACME quota).
-edge.{{REGION}}.{{DOMAIN}}:8443 {
-    tls {
-        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
-    }
-    reverse_proxy 127.0.0.1:9443
-}
-
-# ─── Wildcard cert automation ───────────────────────────────────
+# ─── edge-control admin + wildcard cert ─────────────────────────
 #
-# We DO NOT declare a `*.{{REGION}}.{{DOMAIN}}:8443` site block here:
-# the Caddyfile adapter would emit it as a `srv0.routes` entry with
-# `terminal: true`, and the route ordering (dynamic routes appended
-# after Caddyfile-declared blocks) means the wildcard would shadow
-# every per-session subdomain — viewer URLs would always 404.
+# We DO NOT declare an `edge.{{REGION}}.{{DOMAIN}}:8443 { ... }` site
+# block here, even though we still need that hostname to reverse-
+# proxy to 127.0.0.1:9443. Reason: any Caddyfile-generated `tls {}`
+# block produces an automation policy whose subject is the explicit
+# host (e.g. `edge.sin.dun-studio.xyz`). The wildcard policy we
+# install via the admin API at edge-control startup uses subject
+# `*.{{REGION}}.{{DOMAIN}}`, which also matches `edge.<region>` —
+# Caddy refuses that overlap with `cannot apply more than one
+# automation policy to host` and the entire config fails to load.
 #
-# Instead, edge-control posts a `tls.automation.policies` entry via
-# the admin API at startup so Caddy still issues the wildcard cert
-# via the cloudflare DNS challenge. See `edge-caddy-bridge::AdminClient
-# ::ensure_wildcard_tls_policy`.
+# So instead, edge-control posts BOTH the policy and the
+# `edge.<region>.<domain>` HTTP route via the admin API at startup
+# (`AdminClient::ensure_edge_admin_route` and
+# `ensure_wildcard_tls_policy`). This gives us a single policy
+# covering every `*.<region>.<domain>` cert (edge admin + every
+# per-session viewer subdomain) with no overlap conflicts.
