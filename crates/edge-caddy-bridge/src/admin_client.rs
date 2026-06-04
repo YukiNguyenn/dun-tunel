@@ -6,7 +6,7 @@
 //! `/config/apps/http/servers/srv0/routes/...`. We use `@id` selectors so each
 //! mutation targets `/id/<route_id>` and is idempotent (R23.5).
 
-use crate::route_builder::{build_route, route_id};
+use crate::route_builder::{build_route, build_session_ended_route, route_id};
 use dashmap::DashMap;
 use edge_shared::errors::{EdgeError, EdgeResult};
 use edge_shared::types::CaddyRoute;
@@ -402,6 +402,138 @@ impl AdminClient {
             ws_paths: vec![],
         };
         self.add_route(route).await
+    }
+
+    /// Install a tail-of-routes catch-all that responds `410 Gone`
+    /// for any host matching the wildcard `*.<region>.<domain>`
+    /// without a per-session route in front of it.
+    ///
+    /// Why a tail route instead of relying on Caddy's default empty
+    /// response: when a viewer URL outlives its session (revoked,
+    /// expired, never existed), the wildcard cert + DNS still resolve
+    /// — Caddy completes TLS, then has nothing to dispatch to and
+    /// returns an empty 200 / 404 depending on version. That looks
+    /// like a flaky tunnel from the viewer's perspective. A
+    /// deliberate 410 + short HTML body lets the user understand the
+    /// session ended (and the URL is not coming back).
+    ///
+    /// Why this route is appended (not prepended): Caddy matches
+    /// routes top-down and stops on `terminal: true`. Per-session
+    /// routes (`add_route`) prepend to idx 0 with exact host matchers
+    /// — they win for live sessions. The wildcard host pattern
+    /// `*.<region>.<domain>` is broader and must come AFTER all
+    /// exact-host routes, otherwise it would shadow live sessions.
+    /// `edge.<region>.<domain>` (also installed via admin API) and
+    /// `api.<domain>` (Caddyfile-emitted) are safe because they
+    /// match before the tail in the routes array.
+    pub async fn ensure_session_ended_fallback(
+        &self,
+        region: &str,
+        domain: &str,
+    ) -> EdgeResult<()> {
+        let host_pattern = format!("*.{}.{}", region, domain);
+        let id = format!("dun-tunel-session-ended-{}", region);
+        let body = build_session_ended_route(&id, &host_pattern);
+
+        // Try @id PUT first — fast path on every restart so the entry
+        // stays at the same array slot (= tail) without churning the
+        // whole config tree.
+        let id_url = format!("{}/id/{}", self.inner.base_url, id);
+        let put = self
+            .inner
+            .http
+            .put(&id_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy put session-ended: {e}")))?;
+        let put_status = put.status();
+        if put_status.is_success() {
+            tracing::info!(%host_pattern, %id, "caddy ensure_session_ended_fallback: PUT /id ok");
+            return Ok(());
+        }
+        if put_status.as_u16() != 404 {
+            let body_text = put.text().await.unwrap_or_default();
+            return Err(EdgeError::Config(format!(
+                "caddy put session-ended failed: status={put_status} body={body_text}"
+            )));
+        }
+
+        // First-time install. Append to the tail of the routes array
+        // (Caddy POST against the array path appends).
+        let server_name = self.first_server_name().await?;
+        let routes_url = format!(
+            "{}/config/apps/http/servers/{}/routes",
+            self.inner.base_url, server_name
+        );
+
+        let routes_resp = self
+            .inner
+            .http
+            .get(&routes_url)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy fetch routes: {e}")))?;
+        let routes_status = routes_resp.status();
+
+        if routes_status.is_success() {
+            let post = self
+                .inner
+                .http
+                .post(&routes_url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy append session-ended: {e}")))?;
+            let post_status = post.status();
+            if !post_status.is_success() {
+                let body_text = post.text().await.unwrap_or_default();
+                return Err(EdgeError::Config(format!(
+                    "caddy append session-ended failed: \
+                     status={post_status} body={body_text}"
+                )));
+            }
+            tracing::info!(
+                %server_name,
+                %host_pattern,
+                "caddy ensure_session_ended_fallback: POST /routes (appended)"
+            );
+            return Ok(());
+        }
+
+        if routes_status.as_u16() == 404 {
+            // Routes key missing entirely. PUT creates it with our
+            // single tail route — per-session add_route will later
+            // prepend in front of it.
+            let put_arr = self
+                .inner
+                .http
+                .put(&routes_url)
+                .json(&serde_json::Value::Array(vec![body]))
+                .send()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy create routes (session-ended): {e}")))?;
+            let put_arr_status = put_arr.status();
+            if !put_arr_status.is_success() {
+                let body_text = put_arr.text().await.unwrap_or_default();
+                return Err(EdgeError::Config(format!(
+                    "caddy create routes session-ended failed: \
+                     status={put_arr_status} body={body_text}"
+                )));
+            }
+            tracing::info!(
+                %server_name,
+                %host_pattern,
+                "caddy ensure_session_ended_fallback: PUT /routes (created)"
+            );
+            return Ok(());
+        }
+
+        let body_text = routes_resp.text().await.unwrap_or_default();
+        Err(EdgeError::Config(format!(
+            "caddy fetch routes failed (server={server_name}): \
+             status={routes_status} body={body_text}"
+        )))
     }
 
     /// Bootstrap a TLS automation policy that issues the wildcard

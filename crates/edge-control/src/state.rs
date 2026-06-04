@@ -101,6 +101,27 @@ impl AppState {
                         "ensure_edge_admin_route failed; dun-api → edge admin calls will 404 until next retry"
                     );
                 }
+
+                // Append a tail-of-routes 410 fallback for any
+                // `*.<region>.<domain>` host that lacks a per-session
+                // route. Without this, viewers landing on an expired
+                // / revoked URL would see Caddy's bare default 404
+                // body — confusing because they can't tell whether
+                // the session ended or the tunnel itself is broken.
+                // The 410 page is i18n-friendly Vietnamese and
+                // explicitly says "session ended" so users know to
+                // ask for a fresh share link.
+                if let Err(e) = caddy
+                    .ensure_session_ended_fallback(&cfg.region, domain)
+                    .await
+                {
+                    tracing::warn!(
+                        error = ?e,
+                        region = %cfg.region,
+                        domain = %domain,
+                        "ensure_session_ended_fallback failed; expired viewer URLs will fall back to default Caddy response"
+                    );
+                }
             }
             (Some(_), None) => tracing::warn!(
                 "SHARE_TUNNEL_DOMAIN set but CLOUDFLARE_API_TOKEN missing — wildcard cert will NOT auto-renew"

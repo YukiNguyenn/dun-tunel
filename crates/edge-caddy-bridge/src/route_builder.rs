@@ -129,6 +129,61 @@ pub fn build_route(route: &CaddyRoute, dun_api_upstream: Option<&str>) -> Value 
     })
 }
 
+/// Build a tail-of-routes Caddy entry that responds `410 Gone` for
+/// any host matching `host_pattern` (e.g. `*.sin.dun-studio.xyz`)
+/// when no per-session route picks it up first. Used by
+/// [`AdminClient::ensure_session_ended_fallback`] so a viewer who
+/// hits an expired/revoked URL sees a deliberate "session ended"
+/// page instead of a default Caddy fallback.
+///
+/// The handler emits a small HTML body so the response renders in a
+/// browser (not just a bare status line). `Content-Type` and
+/// `Cache-Control` are set so a CDN / browser cache does not pin
+/// this 410 across a future re-share of the same subdomain.
+pub fn build_session_ended_route(id: &str, host_pattern: &str) -> Value {
+    json!({
+        "@id": id,
+        "match": [{
+            "host": [host_pattern],
+        }],
+        "handle": [{
+            "handler": "subroute",
+            "routes": [{
+                "handle": [{
+                    "handler": "headers",
+                    "response": {
+                        "set": {
+                            "Content-Type": ["text/html; charset=utf-8"],
+                            "Cache-Control": ["no-store"],
+                        }
+                    }
+                }, {
+                    "handler": "static_response",
+                    "status_code": 410,
+                    "body": SESSION_ENDED_BODY,
+                }],
+            }],
+        }],
+        "terminal": true,
+    })
+}
+
+const SESSION_ENDED_BODY: &str = "<!doctype html>\
+<html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>Session ended</title>\
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;\
+background:#0b0d10;color:#e6e6e6;margin:0;display:grid;place-items:center;\
+min-height:100vh}main{max-width:32rem;padding:2rem;text-align:center}\
+h1{font-size:1.5rem;margin:0 0 .5rem;color:#f5f5f5}\
+p{margin:0;color:#9aa0a6;line-height:1.5}\
+code{background:#1a1d22;color:#cdd2d8;padding:.1rem .35rem;border-radius:.2rem;\
+font-family:ui-monospace,monospace;font-size:.9em}</style></head>\
+<body><main><h1>Session ended</h1>\
+<p>Người chia sẻ đã đóng phiên này. Đường dẫn không còn hiệu lực.<br>\
+Hãy yêu cầu họ tạo phiên mới nếu bạn cần truy cập tiếp.</p>\
+</main></body></html>";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +260,31 @@ mod tests {
             inner[0]["handle"][0]["upstreams"][0]["dial"],
             "127.0.0.1:11042"
         );
+    }
+
+    #[test]
+    fn build_session_ended_route_emits_410_with_html_body() {
+        let v = build_session_ended_route(
+            "dun-tunel-session-ended-sin",
+            "*.sin.dun-studio.xyz",
+        );
+        assert_eq!(v["@id"], "dun-tunel-session-ended-sin");
+        assert_eq!(v["match"][0]["host"][0], "*.sin.dun-studio.xyz");
+        assert_eq!(v["terminal"], true);
+        let inner = &v["handle"][0]["routes"][0]["handle"];
+        // First handler sets headers, second emits 410 + HTML body.
+        assert_eq!(inner[0]["handler"], "headers");
+        assert_eq!(
+            inner[0]["response"]["set"]["Content-Type"][0],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            inner[0]["response"]["set"]["Cache-Control"][0],
+            "no-store"
+        );
+        assert_eq!(inner[1]["handler"], "static_response");
+        assert_eq!(inner[1]["status_code"], 410);
+        let body = inner[1]["body"].as_str().unwrap();
+        assert!(body.contains("Session ended"));
     }
 }
