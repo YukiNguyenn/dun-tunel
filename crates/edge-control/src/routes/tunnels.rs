@@ -70,9 +70,23 @@ pub async fn create(
     //    handler can recover the Caddy route host. Without this the
     //    DELETE handler would only know `session_id` but Caddy's @id
     //    is keyed by the host (subdomain), causing route leaks.
+    //    Mirror the entry to disk for restart safety — best-effort:
+    //    if disk write fails we still keep the in-memory entry and
+    //    log so an operator can investigate.
     state
         .session_subdomains
         .insert(req.session_id.clone(), req.subdomain.clone());
+    if let Err(e) = state
+        .subdomain_store
+        .save(&req.session_id, &req.subdomain)
+        .await
+    {
+        tracing::warn!(
+            error = ?e,
+            %req.session_id,
+            "subdomain_store save failed; mapping in-memory only"
+        );
+    }
 
     Ok(Json(CreateSessionResp {
         router_id: provisioned.router_id.to_string(),
@@ -104,6 +118,13 @@ pub async fn deprovision(
         .session_subdomains
         .remove(&session_id)
         .map(|(_, host)| host);
+    // Drop the persistent record too so we don't replay a phantom
+    // mapping on the next restart. Best-effort: a failed remove only
+    // means the file lingers — the next deprovision (or boot rehydrate
+    // followed by stale check) can still clean it up.
+    if let Err(e) = state.subdomain_store.remove(&session_id).await {
+        tracing::warn!(error = ?e, %session_id, "subdomain_store remove failed");
+    }
 
     let caddy_fut = async {
         match subdomain.as_deref() {

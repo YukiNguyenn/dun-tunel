@@ -23,7 +23,7 @@ Phase 1 deploys 1 region (SIN); Phase 3 adds IAD + FRA.
    ```env
    REGION_ID=sin
    EDGE_BIND_PORT=8443
-   DUN_API_ENDPOINT=https://api.dun.app/api
+   DUN_API_ENDPOINT=https://api.dun-studio.xyz/api
    DUN_API_KEY=<24+ char shared secret>
    CADDY_ADMIN_URL=http://127.0.0.1:2019
    RATHOLE_CONFIG_PATH=/etc/rathole/server.toml
@@ -37,7 +37,7 @@ Phase 1 deploys 1 region (SIN); Phase 3 adds IAD + FRA.
 6. Populate `/etc/dun-tunel/caddy.env`:
 
    ```env
-   CLOUDFLARE_API_TOKEN=<scoped DNS:Edit token for share.dun.app zone>
+   CLOUDFLARE_API_TOKEN=<scoped DNS:Edit token for dun-studio.xyz zone>
    ```
 
 7. Render `Caddyfile.tpl` → `/etc/caddy/Caddyfile`:
@@ -49,7 +49,7 @@ Phase 1 deploys 1 region (SIN); Phase 3 adds IAD + FRA.
 
 8. Render `rathole.tpl.toml` → `/etc/rathole/server.toml`. Replace
    the `pkcs12` password placeholder with a real value generated via
-   `openssl pkcs12 -export …` (cert chain for `tunnel.<region>.share.dun.app`).
+   `openssl pkcs12 -export …` (cert chain for `tunnel.<region>.dun-studio.xyz`).
 
 9. Install systemd units:
 
@@ -71,8 +71,10 @@ For a region `sin`:
 
 | Record                          | Type | Value                |
 |---------------------------------|------|----------------------|
-| `*.sin.share.dun.app`           | A    | `<edge-vps-ip>`      |
-| `tunnel.sin.share.dun.app`      | A    | `<edge-vps-ip>`      |
+| `api.dun-studio.xyz`            | A    | `<edge-vps-ip>`      |
+| `edge.sin.dun-studio.xyz`       | A    | `<edge-vps-ip>`      |
+| `*.sin.dun-studio.xyz`          | A    | `<edge-vps-ip>`      |
+| `tunnel.sin.dun-studio.xyz`     | A    | `<edge-vps-ip>`      |
 
 The wildcard A record covers viewer subdomains. The non-wildcard
 `tunnel.<region>` host is what dun-app rathole clients dial; its
@@ -93,7 +95,7 @@ If the update is breaking, drain first:
 ```bash
 # stop accepting new tunnels (admin)
 curl -X POST -H "x-edge-api-key:$DUN_API_KEY" \
-    https://api.dun.app/admin/region/sin/drain
+    https://api.dun-studio.xyz/admin/region/sin/drain
 # wait until activeSessions == 0 (visible via /healthz)
 sudo systemctl restart edge-control
 ```

@@ -5,6 +5,7 @@
 //! single source-of-truth (R6.4, 5b.7).
 
 use crate::config::EdgeConfig;
+use crate::subdomain_store::SubdomainStore;
 use anyhow::Result;
 use dashmap::DashMap;
 use edge_bandwidth::persistence::SequenceStore;
@@ -32,8 +33,12 @@ pub struct AppState {
     /// Maps `session_id` → Caddy route host (subdomain) so the
     /// deprovision handler can locate the registered route entry.
     /// Populated on `POST /v1/tunnels`, drained on `DELETE` or on
-    /// failed provisioning rollback.
+    /// failed provisioning rollback. Backed by `SubdomainStore` for
+    /// restart safety — without persistence, a restart while sessions
+    /// are active would lose the in-memory entries and subsequent
+    /// DELETEs would silently leak Caddy routes.
     pub session_subdomains: Arc<DashMap<SessionId, String>>,
+    pub subdomain_store: SubdomainStore,
 }
 
 impl AppState {
@@ -53,6 +58,28 @@ impl AppState {
             cfg.region.clone(),
             SequenceStore::new(cfg.persistent_queue_dir.clone()),
         );
+
+        // Subdomain store: rebuild session_id → subdomain map at boot.
+        // Survives restart so the deprovision handler can still
+        // resolve the Caddy @id key (host) for sessions provisioned
+        // before the restart.
+        let subdomain_store = SubdomainStore::new(cfg.persistent_queue_dir.clone());
+        if let Err(e) = subdomain_store.ensure_dir().await {
+            tracing::warn!(error = ?e, "subdomain_store ensure_dir failed; continuing without persistence");
+        }
+        let session_subdomains = Arc::new(DashMap::new());
+        match subdomain_store.load_all().await {
+            Ok(map) => {
+                let count = map.len();
+                for (k, v) in map {
+                    session_subdomains.insert(k, v);
+                }
+                if count > 0 {
+                    tracing::info!(count, "rehydrated session→subdomain mapping from disk");
+                }
+            }
+            Err(e) => tracing::warn!(error = ?e, "subdomain_store load_all failed; starting empty"),
+        }
 
         let mut jwt = JwtVerifier::new();
         if let Some(secret) = &cfg.jwt_secret_v1 {
@@ -85,7 +112,8 @@ impl AppState {
             callback,
             bandwidth,
             jwt,
-            session_subdomains: Arc::new(DashMap::new()),
+            session_subdomains,
+            subdomain_store,
         })
     }
 }

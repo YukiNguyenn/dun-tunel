@@ -59,20 +59,20 @@ mod tests {
     #[test]
     fn route_id_replaces_dots() {
         assert_eq!(
-            route_id("abc123.sin.share.dun.app"),
-            "dun-tunel-abc123_sin_share_dun_app"
+            route_id("abc123.sin.dun-studio.xyz"),
+            "dun-tunel-abc123_sin_dun-studio_xyz"
         );
     }
 
     #[test]
     fn build_route_has_deterministic_id() {
         let r = CaddyRoute {
-            host: "abc.sin.share.dun.app".into(),
+            host: "abc.sin.dun-studio.xyz".into(),
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec!["/api/ws".into()],
         };
         let v = build_route(&r);
-        assert_eq!(v["@id"], "dun-tunel-abc_sin_share_dun_app");
-        assert_eq!(v["match"][0]["host"][0], "abc.sin.share.dun.app");
+        assert_eq!(v["@id"], "dun-tunel-abc_sin_dun-studio_xyz");
+        assert_eq!(v["match"][0]["host"][0], "abc.sin.dun-studio.xyz");
     }
 }

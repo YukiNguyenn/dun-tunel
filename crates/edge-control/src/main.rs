@@ -11,6 +11,7 @@ mod auth;
 mod config;
 mod routes;
 mod state;
+mod subdomain_store;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -14,7 +14,7 @@ pub type RegionId = String;
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionReq {
     pub session_id: SessionId,
-    pub subdomain: String, // <random16>.<region>.share.dun.app
+    pub subdomain: String, // <random16>.<region>.dun-studio.xyz
     pub tunnel_token_hash: String, // sha256 hex
     pub viewer_token_hash: String,
     pub codecs: Vec<MediaCodec>,

@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn route_id_stable() {
-        let host = "abc123.sin.share.dun.app";
+        let host = "abc123.sin.dun-studio.xyz";
         assert_eq!(route_id(host), route_id(host));
     }
 }
