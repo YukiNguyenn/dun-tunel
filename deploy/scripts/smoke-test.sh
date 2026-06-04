@@ -105,11 +105,24 @@ curl -fsS -X DELETE \
     || fail "deprovision returned non-2xx"
 pass "deprovision returned 2xx"
 
-# Caddy route should be gone (404).
+# Caddy route should be gone (404). Test this two ways to defend
+# against a regression that surfaced earlier: the deprovision handler
+# previously called `caddy.remove_route(session_id)` instead of
+# `remove_route(subdomain)`, which made Caddy answer 404 for the
+# WRONG @id while the real route entry stayed in the config tree.
+#   - Probe 1: official @id derived from subdomain (must be 404).
+#   - Probe 2: scan Caddy's automation domain list — the subdomain
+#     should NOT appear after delete. Catches stuck routes regardless
+#     of @id name.
 sleep 1
 CADDY_AFTER=$(curl -s -o /dev/null -w '%{http_code}' "${CADDY_ADMIN_URL}/id/${ROUTE_ID}")
-[[ "$CADDY_AFTER" == "404" ]] || fail "Caddy still has route after delete (status=$CADDY_AFTER)"
-pass "Caddy route cleaned"
+[[ "$CADDY_AFTER" == "404" ]] || fail "Caddy still has route after delete (status=$CADDY_AFTER, id=${ROUTE_ID})"
+
+DOMAIN_LIST=$(curl -fsS "${CADDY_ADMIN_URL}/config/apps/tls/automation/policies" 2>/dev/null || echo "")
+if echo "$DOMAIN_LIST" | grep -q "\"${SUBDOMAIN}\""; then
+    fail "Caddy still tracks ${SUBDOMAIN} in tls.automation.policies after delete"
+fi
+pass "Caddy route cleaned (id 404 + subdomain not in automation list)"
 
 echo
 echo "All smoke tests passed."

@@ -697,6 +697,7 @@ dependencies = [
  "axum",
  "axum-server",
  "chrono",
+ "dashmap",
  "edge-bandwidth",
  "edge-caddy-bridge",
  "edge-callback-client",
