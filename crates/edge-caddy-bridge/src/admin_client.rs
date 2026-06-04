@@ -128,28 +128,92 @@ impl AdminClient {
             .ok_or_else(|| EdgeError::Config("caddy servers list empty".into()))
     }
 
-    /// Idempotent removal. 404 → Ok (already absent).
+    /// Idempotent removal. Caddy DELETE qua `/id/<name>` đôi khi
+    /// không cleanup hoàn toàn entry trong server routes array (đặc
+    /// biệt khi entry được POST qua `/...routes/...` thay vì PUT).
+    /// Workaround: verify sau DELETE, nếu route vẫn tồn tại thì
+    /// fallback DELETE bằng absolute path qua server.routes index.
     pub async fn remove_route(&self, host: &str) -> EdgeResult<()> {
         let id = route_id(host);
-        let url = format!("{}/id/{}", self.inner.base_url, id);
+        let id_url = format!("{}/id/{}", self.inner.base_url, id);
 
+        // Step 1: DELETE qua @id alias. Mostly work, nhưng có race.
         let resp = self
             .inner
             .http
-            .delete(&url)
+            .delete(&id_url)
             .send()
             .await
             .map_err(|e| EdgeError::Config(format!("caddy delete route: {e}")))?;
-
         let status = resp.status();
-        if status.is_success() || status.as_u16() == 404 {
+        if !status.is_success() && status.as_u16() != 404 {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(EdgeError::Config(format!(
+                "caddy delete route failed: status={status} body={body}"
+            )));
+        }
+
+        // Step 2: verify entry đã thực sự gone. Caddy thỉnh thoảng
+        // giữ stale entry trong server.routes array dù alias đã xóa.
+        let probe = self
+            .inner
+            .http
+            .get(&id_url)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy verify route deletion: {e}")))?;
+        if probe.status().as_u16() == 404 {
             self.inner.routes.remove(host);
             return Ok(());
         }
-        let body = resp.text().await.unwrap_or_default();
-        Err(EdgeError::Config(format!(
-            "caddy delete route failed: status={status} body={body}"
-        )))
+
+        // Step 3: fallback — scan server routes array, tìm index có
+        // matching @id, DELETE absolute path. Dùng được khi Caddy bị
+        // alias-leak.
+        let server_name = self.first_server_name().await?;
+        let routes_url = format!(
+            "{}/config/apps/http/servers/{}/routes",
+            self.inner.base_url, server_name
+        );
+        let routes_resp = self
+            .inner
+            .http
+            .get(&routes_url)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy fetch routes: {e}")))?;
+        let routes_json: serde_json::Value = routes_resp
+            .json()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy routes parse: {e}")))?;
+        let routes_arr = routes_json.as_array().ok_or_else(|| {
+            EdgeError::Config(format!("caddy routes not an array: {routes_json}"))
+        })?;
+
+        // Iterate từ cuối về đầu để DELETE bằng index không invalidate
+        // các index sau (sau khi xóa entry i, các entry > i shift lên).
+        for (idx, entry) in routes_arr.iter().enumerate().rev() {
+            if entry.get("@id").and_then(|v| v.as_str()) == Some(id.as_str()) {
+                let abs_url = format!("{}/{}", routes_url, idx);
+                let del = self
+                    .inner
+                    .http
+                    .delete(&abs_url)
+                    .send()
+                    .await
+                    .map_err(|e| EdgeError::Config(format!("caddy delete absolute: {e}")))?;
+                let del_status = del.status();
+                if !del_status.is_success() {
+                    let body = del.text().await.unwrap_or_default();
+                    return Err(EdgeError::Config(format!(
+                        "caddy delete absolute failed: status={del_status} body={body}"
+                    )));
+                }
+                break;
+            }
+        }
+        self.inner.routes.remove(host);
+        Ok(())
     }
 
     /// Returns local cached view; used by snapshot reconciliation (R22).
