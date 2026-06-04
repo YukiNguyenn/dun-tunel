@@ -53,7 +53,14 @@ edge.{{REGION}}.{{DOMAIN}}:8443 {
         dns cloudflare {env.CLOUDFLARE_API_TOKEN}
     }
 
-    # edge-caddy-bridge PATCH các route entry vào @id sau khi
-    # provision tunnel. Không match được host nào → 404.
+    # edge-caddy-bridge POST các route entry vào array `routes` của
+    # server `srv0` qua admin API (path `/config/apps/http/servers/srv0/routes/...`).
+    # Routes match theo Host (subdomain) → reverse_proxy upstream
+    # `127.0.0.1:<dynamic-port>` mà rathole gán per session.
+    #
+    # Catch-all dưới đây chạy SAU dynamic routes (Caddy match theo
+    # thứ tự routes array; static block trong Caddyfile được expand
+    # thành route entries cuối array). Tunnel chưa có session →
+    # match catch-all → 404.
     respond 404
 }
