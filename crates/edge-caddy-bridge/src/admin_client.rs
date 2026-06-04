@@ -136,6 +136,7 @@ impl AdminClient {
     pub async fn remove_route(&self, host: &str) -> EdgeResult<()> {
         let id = route_id(host);
         let id_url = format!("{}/id/{}", self.inner.base_url, id);
+        tracing::info!(%host, %id, "caddy remove_route: starting");
 
         // Step 1: DELETE qua @id alias. Mostly work, nhưng có race.
         let resp = self
@@ -146,6 +147,7 @@ impl AdminClient {
             .await
             .map_err(|e| EdgeError::Config(format!("caddy delete route: {e}")))?;
         let status = resp.status();
+        tracing::info!(%id, ?status, "caddy remove_route: DELETE /id alias");
         if !status.is_success() && status.as_u16() != 404 {
             let body = resp.text().await.unwrap_or_default();
             return Err(EdgeError::Config(format!(
@@ -162,7 +164,9 @@ impl AdminClient {
             .send()
             .await
             .map_err(|e| EdgeError::Config(format!("caddy verify route deletion: {e}")))?;
-        if probe.status().as_u16() == 404 {
+        let probe_status = probe.status();
+        tracing::info!(%id, ?probe_status, "caddy remove_route: verify GET /id");
+        if probe_status.as_u16() == 404 {
             self.inner.routes.remove(host);
             return Ok(());
         }
@@ -175,6 +179,7 @@ impl AdminClient {
             "{}/config/apps/http/servers/{}/routes",
             self.inner.base_url, server_name
         );
+        tracing::info!(%server_name, "caddy remove_route: fallback scan routes array");
         let routes_resp = self
             .inner
             .http
@@ -189,12 +194,19 @@ impl AdminClient {
         let routes_arr = routes_json.as_array().ok_or_else(|| {
             EdgeError::Config(format!("caddy routes not an array: {routes_json}"))
         })?;
+        tracing::info!(
+            count = routes_arr.len(),
+            "caddy remove_route: scanning routes array"
+        );
 
+        let mut found = false;
         // Iterate từ cuối về đầu để DELETE bằng index không invalidate
         // các index sau (sau khi xóa entry i, các entry > i shift lên).
         for (idx, entry) in routes_arr.iter().enumerate().rev() {
-            if entry.get("@id").and_then(|v| v.as_str()) == Some(id.as_str()) {
+            let entry_id = entry.get("@id").and_then(|v| v.as_str()).unwrap_or("");
+            if entry_id == id.as_str() {
                 let abs_url = format!("{}/{}", routes_url, idx);
+                tracing::info!(%abs_url, "caddy remove_route: DELETE absolute");
                 let del = self
                     .inner
                     .http
@@ -209,8 +221,12 @@ impl AdminClient {
                         "caddy delete absolute failed: status={del_status} body={body}"
                     )));
                 }
+                found = true;
                 break;
             }
+        }
+        if !found {
+            tracing::warn!(%id, "caddy remove_route: probe said exists but @id not in array");
         }
         self.inner.routes.remove(host);
         Ok(())

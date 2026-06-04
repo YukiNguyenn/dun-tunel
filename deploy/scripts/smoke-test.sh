@@ -14,6 +14,9 @@
 #   EDGE_PORT       — default 8443
 #   DUN_API_KEY     — same key edge-control reads from env
 #   CADDY_ADMIN_URL — default http://127.0.0.1:2019
+#   REGION_ID       — default sin
+#   SHARE_TUNNEL_DOMAIN — default dun-studio.xyz (must match Caddy +
+#                          DNS + Cloudflare zone)
 #
 # All assertions print PASS/FAIL on stdout and exit non-zero on the
 # first failure so the script is CI-friendly.
@@ -24,10 +27,12 @@ EDGE_HOST="${EDGE_HOST:-127.0.0.1}"
 EDGE_PORT="${EDGE_PORT:-8443}"
 EDGE_BASE="http://${EDGE_HOST}:${EDGE_PORT}"
 CADDY_ADMIN_URL="${CADDY_ADMIN_URL:-http://127.0.0.1:2019}"
+REGION_ID="${REGION_ID:-sin}"
+SHARE_TUNNEL_DOMAIN="${SHARE_TUNNEL_DOMAIN:-dun-studio.xyz}"
 : "${DUN_API_KEY:?DUN_API_KEY env var required}"
 
 SESSION_ID="smoke-$(date +%s)-$$"
-SUBDOMAIN="${SESSION_ID}.sin.share.dun.app"
+SUBDOMAIN="${SESSION_ID}.${REGION_ID}.${SHARE_TUNNEL_DOMAIN}"
 ROUTE_ID="dun-tunel-$(echo "$SUBDOMAIN" | tr '.' '_')"
 TOKEN_HASH="0000000000000000000000000000000000000000000000000000000000000000"
 
