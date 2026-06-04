@@ -46,7 +46,20 @@ impl AppState {
         let sfu = RouterManager::new(cfg.sfu_workers).await?;
         let rathole = ServiceRegistry::new(cfg.rathole_config_path.clone());
         let port_allocator = Arc::new(PortAllocator::new());
-        let caddy = AdminClient::new(cfg.caddy_admin_url.clone());
+        // Pass dun-api's loopback upstream into the Caddy admin client
+        // so every per-session route inserts a split-route block for
+        // viewer-cookie endpoints (R9.4). Path: parse `host:port` out
+        // of `DUN_API_ENDPOINT`. We accept the canonical
+        // `http://host:port[/path]` form and tolerate trailing slashes.
+        let dun_api_upstream = parse_dun_api_upstream(&cfg.dun_api_endpoint);
+        if dun_api_upstream.is_none() {
+            tracing::warn!(
+                endpoint = %cfg.dun_api_endpoint,
+                "could not parse host:port from DUN_API_ENDPOINT — viewer cookie endpoints will 404 \
+                 because Caddy will route `/viewer/exchange` into the rathole tunnel instead of dun-api"
+            );
+        }
+        let caddy = AdminClient::with_dun_api(cfg.caddy_admin_url.clone(), dun_api_upstream);
 
         // Bootstrap the wildcard TLS policy when both domain + CF
         // token are configured. This replaces the `*.<region>.<domain>:8443`
@@ -164,5 +177,64 @@ impl AppState {
             session_subdomains,
             subdomain_store,
         })
+    }
+}
+
+/// Extract `host:port` from a `DUN_API_ENDPOINT` like
+/// `http://localhost:3010` or `http://localhost:3010/api`. Caddy
+/// reverse_proxy `dial` only wants the authority part — including the
+/// scheme would make Caddy try to connect to `tcp://http`. Returns
+/// `None` when the endpoint is malformed or missing a port. Caller
+/// surfaces a warning rather than failing startup so dev / unit-test
+/// setups that don't run dun-api on the same host can still come up
+/// (just with the legacy "everything goes through the tunnel" route
+/// shape — which means viewer cookie endpoints will 404).
+fn parse_dun_api_upstream(endpoint: &str) -> Option<String> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip scheme prefix if present.
+    let after_scheme = trimmed
+        .splitn(2, "://")
+        .nth(1)
+        .unwrap_or(trimmed);
+    // Authority is everything before the first '/'.
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    // Require an explicit port — otherwise Caddy would try the dial
+    // on port 0 which fails immediately.
+    if !authority.contains(':') {
+        return None;
+    }
+    Some(authority.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dun_api_upstream_strips_scheme_and_path() {
+        assert_eq!(
+            parse_dun_api_upstream("http://localhost:3010"),
+            Some("localhost:3010".to_string())
+        );
+        assert_eq!(
+            parse_dun_api_upstream("http://localhost:3010/api"),
+            Some("localhost:3010".to_string())
+        );
+        assert_eq!(
+            parse_dun_api_upstream("https://api.dun-studio.xyz:8443/v1/"),
+            Some("api.dun-studio.xyz:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_dun_api_upstream_rejects_missing_port() {
+        assert_eq!(parse_dun_api_upstream("http://localhost"), None);
+        assert_eq!(parse_dun_api_upstream(""), None);
     }
 }

@@ -21,12 +21,26 @@ pub struct AdminClient {
 
 struct AdminClientInner {
     base_url: String,
+    /// Optional `host:port` of dun-api as seen from the Caddy
+    /// container loopback. When `Some`, every viewer subdomain route
+    /// inserts a split-route block forwarding `/viewer/exchange|password|
+    /// refresh-cookie` to dun-api with a `/api` prefix rewrite — so
+    /// the cookie exchange happens on the same origin as the viewer
+    /// page (R9.4 cookie domain pinning). When `None`, we fall back
+    /// to the legacy "everything goes through the tunnel" shape.
+    dun_api_upstream: Option<String>,
     routes: DashMap<String, CaddyRoute>,
     http: reqwest::Client,
 }
 
 impl AdminClient {
     pub fn new(base_url: String) -> Self {
+        Self::with_dun_api(base_url, None)
+    }
+
+    /// Build an `AdminClient` that knows where to find dun-api so it
+    /// can install split-route blocks for viewer-cookie endpoints.
+    pub fn with_dun_api(base_url: String, dun_api_upstream: Option<String>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -34,6 +48,7 @@ impl AdminClient {
         Self {
             inner: Arc::new(AdminClientInner {
                 base_url,
+                dun_api_upstream,
                 routes: DashMap::new(),
                 http,
             }),
@@ -68,7 +83,7 @@ impl AdminClient {
     /// us an explicit before/after snapshot we can verify.
     pub async fn add_route(&self, route: CaddyRoute) -> EdgeResult<()> {
         let id = route_id(&route.host);
-        let body = build_route(&route);
+        let body = build_route(&route, self.inner.dun_api_upstream.as_deref());
 
         // Attempt 1: PUT /id/<route_id> for in-place update.
         let id_url = format!("{}/id/{}", self.inner.base_url, id);
