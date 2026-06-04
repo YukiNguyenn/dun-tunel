@@ -14,7 +14,8 @@ use std::num::NonZeroU32;
 const DEFAULT_RTC_MIN_PORT: u16 = 50_000;
 const DEFAULT_RTC_MAX_PORT: u16 = 60_000;
 
-/// PlainTransport per-session port pool (R8.1).
+/// PlainTransport per-session UDP port pool, **shared across the whole
+/// Edge_Server** (not per-user, not per-session).
 ///
 /// Each ShareSession provisions its own PlainTransport for the Neko →
 /// SFU GStreamer pipeline. Mediasoup binds an exclusive UDP port per
@@ -23,11 +24,19 @@ const DEFAULT_RTC_MAX_PORT: u16 = 60_000;
 /// `uv_udp_bind() failed: address already in use` (observed on
 /// 2026-06-04 after smoke #1 left a lingering bind).
 ///
-/// Range chosen to sit between conventional VoIP ports (5004 was the
-/// PoC default) and the WebRTC ephemeral range (50000+). 100 ports is
-/// 50× headroom over our viewer-cap target so we never run out.
+/// Capacity sizing:
+///   pool_size = max concurrent share sessions on this Edge_Server
+///
+/// 5000 ports comfortably covers ~165 Enterprise users (30 sessions
+/// each), ~1000 Pro users (2 each), or any realistic mix until the
+/// real bottleneck (CPU / bandwidth) bites. Range deliberately ≥ 4×
+/// the WebRTC-Consumer range (50000-60000) to make the two pools
+/// trivial to grow independently.
+///
+/// Operators tuning a constrained VPS can shrink via env vars
+/// `SFU_PLAIN_RTP_MIN_PORT` / `SFU_PLAIN_RTP_MAX_PORT`.
 const DEFAULT_PLAIN_RTP_MIN_PORT: u16 = 5_000;
-const DEFAULT_PLAIN_RTP_MAX_PORT: u16 = 5_099;
+const DEFAULT_PLAIN_RTP_MAX_PORT: u16 = 9_999;
 
 const PLAIN_PAYLOAD_TYPE: u8 = 96;
 const PLAIN_CLOCK_RATE: u32 = 90_000;

@@ -24,7 +24,8 @@ echo "==> Configuring firewall"
 sudo ufw allow 22/tcp                # SSH
 sudo ufw allow 443/tcp               # Caddy HTTPS
 sudo ufw allow 2333/tcp              # Rathole control
-sudo ufw allow 50000:60000/udp       # mediasoup RTP
+sudo ufw allow 5000:9999/udp         # mediasoup PlainTransport (Neko ingest, per-session)
+sudo ufw allow 50000:60000/udp       # mediasoup RTP (viewer Consumer transports)
 sudo ufw --force enable
 
 echo "==> Copy Caddyfile and rathole config templates"
