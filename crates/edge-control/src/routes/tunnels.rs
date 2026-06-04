@@ -66,6 +66,14 @@ pub async fn create(
         }
     };
 
+    // 5. Persist session_id → subdomain mapping so the deprovision
+    //    handler can recover the Caddy route host. Without this the
+    //    DELETE handler would only know `session_id` but Caddy's @id
+    //    is keyed by the host (subdomain), causing route leaks.
+    state
+        .session_subdomains
+        .insert(req.session_id.clone(), req.subdomain.clone());
+
     Ok(Json(CreateSessionResp {
         router_id: provisioned.router_id.to_string(),
         // Phase 2: AES-GCM envelope (R16.4) wraps these blobs. Phase 1 →
@@ -89,9 +97,30 @@ pub async fn deprovision(
 ) -> StatusCode {
     tracing::info!(%session_id, "deprovision session");
 
+    // Lookup + drop subdomain mapping registered at create time.
+    // Idempotent: a second DELETE for the same session yields None and
+    // we just skip the Caddy call (route is already gone).
+    let subdomain = state
+        .session_subdomains
+        .remove(&session_id)
+        .map(|(_, host)| host);
+
+    let caddy_fut = async {
+        match subdomain.as_deref() {
+            Some(host) => state.caddy.remove_route(host).await,
+            None => {
+                tracing::debug!(
+                    %session_id,
+                    "no subdomain mapping (already deprovisioned or never provisioned)"
+                );
+                Ok(())
+            }
+        }
+    };
+
     // Best-effort cleanup all components in parallel
     let (caddy_res, rathole_res, _) = tokio::join!(
-        state.caddy.remove_route(&session_id),
+        caddy_fut,
         state.rathole.deregister(&session_id),
         state.sfu.close_session(&session_id),
     );

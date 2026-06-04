@@ -6,6 +6,7 @@
 
 use crate::config::EdgeConfig;
 use anyhow::Result;
+use dashmap::DashMap;
 use edge_bandwidth::persistence::SequenceStore;
 use edge_bandwidth::BandwidthReporter;
 use edge_caddy_bridge::AdminClient;
@@ -13,6 +14,7 @@ use edge_callback_client::Client as CallbackClient;
 use edge_rathole_bridge::{PortAllocator, ServiceRegistry};
 use edge_sfu::RouterManager;
 use edge_shared::jwt::JwtVerifier;
+use edge_shared::types::SessionId;
 use edge_shared::HttpRevocationOracle;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,6 +29,11 @@ pub struct AppState {
     pub callback: CallbackClient,
     pub bandwidth: BandwidthReporter,
     pub jwt: JwtVerifier,
+    /// Maps `session_id` → Caddy route host (subdomain) so the
+    /// deprovision handler can locate the registered route entry.
+    /// Populated on `POST /v1/tunnels`, drained on `DELETE` or on
+    /// failed provisioning rollback.
+    pub session_subdomains: Arc<DashMap<SessionId, String>>,
 }
 
 impl AppState {
@@ -78,6 +85,7 @@ impl AppState {
             callback,
             bandwidth,
             jwt,
+            session_subdomains: Arc::new(DashMap::new()),
         })
     }
 }

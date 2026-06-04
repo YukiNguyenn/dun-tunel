@@ -28,5 +28,6 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+dashmap.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
