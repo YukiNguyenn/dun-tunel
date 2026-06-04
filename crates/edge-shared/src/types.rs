@@ -69,6 +69,7 @@ pub struct TunnelEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MediaCodec {
     pub kind: String, // "audio" | "video"
     pub mime_type: String,
