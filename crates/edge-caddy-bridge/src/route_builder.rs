@@ -42,22 +42,35 @@ const DUN_API_PATH_PREFIXES: &[&str] = &[
 /// `/viewer/` itself is allowed because it does not contain any
 /// session data — it is the JS bundle that loads the share session
 /// (and triggers a 401 if the cookie is missing/invalid via
-/// `sessionEndedGuard`). Asset paths cover Vite's default output:
-///   - `/assets/*` (hashed JS / CSS / fonts)
-///   - `/env.js` (runtime config injection)
-///   - `/favicon*`
+/// `sessionEndedGuard`). Asset paths cover common Vite output
+/// shapes:
 ///   - `/viewer` and `/viewer/` (the index.html shell)
+///   - `/viewer/index.html`
+///   - `/static/viewer/*` (default container build with
+///     `base: '/static/viewer/'`)
+///   - `/assets/*` (Vite default when `base: '/'`)
+///   - `/static/*` (catch-all for any other subdir of `/static/`)
+///   - `/env.js` (runtime config injection)
+///   - `/favicon*`, `/robots.txt`
 ///
 /// Without this bypass, the very first GET `/viewer/` from a fresh
 /// link would 401 because the user has no cookie yet — they must
 /// load the page to run the JS that POSTs `/viewer/exchange`.
+///
+/// We err on the side of generous bypass for static asset paths:
+/// they contain no session data, so blocking them only breaks the
+/// page without adding security. The cookie check still gates the
+/// real session traffic — `/ws`, `/api/*`, neko REST, mediasoup
+/// signalling — through the catch-all auth-gated tail route.
 const VIEWER_PUBLIC_PATHS: &[&str] = &[
     "/viewer",
     "/viewer/",
     "/viewer/index.html",
+    "/static/*",
     "/assets/*",
     "/env.js",
     "/favicon*",
+    "/robots.txt",
 ];
 
 /// Compute the deterministic `@id` for a route, derived from host.
@@ -381,6 +394,7 @@ mod tests {
             .map(|p| p.as_str().unwrap().to_string())
             .collect();
         assert!(paths.iter().any(|p| p == "/viewer/"));
+        assert!(paths.iter().any(|p| p == "/static/*"));
         assert!(paths.iter().any(|p| p == "/assets/*"));
 
         // forward_auth → tunnel
