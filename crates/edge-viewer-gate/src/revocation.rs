@@ -49,6 +49,12 @@ struct Inner {
     /// [`RevocationList::is_fresh`] to decide if strict-mode
     /// verification should fail-CLOSED.
     last_success: Option<Instant>,
+    /// Last `ETag` received from dun-api. Sent back as `If-None-Match`
+    /// on the next poll so the server can short-circuit with `304
+    /// Not Modified` when the list has not changed. Avoids parsing
+    /// the body and saves nearly all egress bandwidth on a steady
+    /// state where revocations are rare.
+    last_etag: Option<String>,
 }
 
 #[derive(Clone)]
@@ -77,6 +83,7 @@ impl RevocationList {
         let inner = Arc::new(RwLock::new(Inner {
             set: HashSet::new(),
             last_success: None,
+            last_etag: None,
         }));
         let polling_enabled = url.is_some();
 
@@ -94,24 +101,53 @@ impl RevocationList {
                     if let Some(key) = &api_key {
                         req = req.header("X-Edge-Api-Key", key);
                     }
+                    // Conditional GET: if we already have a snapshot
+                    // dun-api can short-circuit with 304 when the set
+                    // has not changed since.
+                    let current_etag = {
+                        let guard = inner_clone.read().await;
+                        guard.last_etag.clone()
+                    };
+                    if let Some(etag) = &current_etag {
+                        req = req.header("If-None-Match", etag);
+                    }
                     match req.send().await {
-                        Ok(resp) => match resp.error_for_status() {
-                            Ok(resp) => match resp.json::<RevokedListResponse>().await {
-                                Ok(body) => {
-                                    let new: HashSet<String> =
-                                        body.jtis.into_iter().collect();
-                                    let mut guard = inner_clone.write().await;
-                                    guard.set = new;
-                                    guard.last_success = Some(Instant::now());
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "revocation list parse failed")
-                                }
-                            },
-                            Err(e) => {
-                                tracing::warn!(error = %e, "revocation list http error")
+                        Ok(resp) => {
+                            // 304 Not Modified — refresh `last_success`
+                            // so strict-mode stays happy, keep the set
+                            // and etag unchanged.
+                            if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+                                let mut guard = inner_clone.write().await;
+                                guard.last_success = Some(Instant::now());
+                                continue;
                             }
-                        },
+                            // Non-304 success: read the new ETag
+                            // BEFORE consuming the body (resp is
+                            // moved by `.json()`).
+                            let new_etag = resp
+                                .headers()
+                                .get(reqwest::header::ETAG)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+                            match resp.error_for_status() {
+                                Ok(resp) => match resp.json::<RevokedListResponse>().await {
+                                    Ok(body) => {
+                                        let new: HashSet<String> =
+                                            body.jtis.into_iter().collect();
+                                        let mut guard = inner_clone.write().await;
+                                        guard.set = new;
+                                        guard.last_success = Some(Instant::now());
+                                        guard.last_etag = new_etag;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "revocation list parse failed")
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "revocation list http error")
+                                }
+                            }
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "revocation list fetch failed")
                         }
