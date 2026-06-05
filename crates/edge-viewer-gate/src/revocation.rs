@@ -89,14 +89,46 @@ impl RevocationList {
 
         if let Some(url) = url {
             let inner_clone = inner.clone();
+            let max_staleness_clone = max_staleness;
             tokio::spawn(async move {
                 let client = reqwest::Client::builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .expect("reqwest client build");
-                let mut ticker = tokio::time::interval(poll_interval);
+
+                // Adaptive backoff so an idle deployment (no active
+                // sessions, or lots of sessions but no recent
+                // revoke) doesn't burn requests on a tight 5s tick.
+                //
+                //   * `poll_interval` is the floor — used right after
+                //     a 200 OK (set changed) or any error.
+                //   * On consecutive 304 Not Modified responses the
+                //     wait doubles each time up to `cap`. The set
+                //     hasn't changed for a while; there's nothing to
+                //     mirror.
+                //   * `cap` is `max_staleness / 2` so strict-mode
+                //     (`is_fresh()`) cannot trip just because we
+                //     decided to slow down. With the default
+                //     30s max_staleness this caps the interval at
+                //     15s — still well under the strict threshold.
+                //   * The cap also has a hard ceiling of 60s so a
+                //     tester who passes an outrageous max_staleness
+                //     doesn't end up with a multi-minute polling
+                //     hole that would mask real outages.
+                let base = poll_interval.max(Duration::from_secs(1));
+                let cap_from_staleness = max_staleness_clone
+                    .checked_div(2)
+                    .unwrap_or(Duration::from_secs(60));
+                let cap = cap_from_staleness.min(Duration::from_secs(60)).max(base);
+                let mut quiet_streak: u32 = 0;
+                // First poll fires immediately so verify() doesn't
+                // block on a cold cache.
+                let mut next_at = Instant::now();
                 loop {
-                    ticker.tick().await;
+                    let now = Instant::now();
+                    if next_at > now {
+                        tokio::time::sleep(next_at - now).await;
+                    }
                     let mut req = client.get(&url);
                     if let Some(key) = &api_key {
                         req = req.header("X-Edge-Api-Key", key);
@@ -111,14 +143,21 @@ impl RevocationList {
                     if let Some(etag) = &current_etag {
                         req = req.header("If-None-Match", etag);
                     }
+                    let mut next_wait = base;
                     match req.send().await {
                         Ok(resp) => {
                             // 304 Not Modified — refresh `last_success`
                             // so strict-mode stays happy, keep the set
-                            // and etag unchanged.
+                            // and etag unchanged. Bump the streak so
+                            // the next sleep stretches.
                             if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
                                 let mut guard = inner_clone.write().await;
                                 guard.last_success = Some(Instant::now());
+                                drop(guard);
+                                quiet_streak = quiet_streak.saturating_add(1);
+                                let factor = 1u32 << quiet_streak.min(4); // ×2…×16
+                                next_wait = (base.saturating_mul(factor)).min(cap);
+                                next_at = Instant::now() + next_wait;
                                 continue;
                             }
                             // Non-304 success: read the new ETag
@@ -138,6 +177,13 @@ impl RevocationList {
                                         guard.set = new;
                                         guard.last_success = Some(Instant::now());
                                         guard.last_etag = new_etag;
+                                        drop(guard);
+                                        // Set changed — reset to the
+                                        // base interval so any
+                                        // follow-up revoke is picked
+                                        // up promptly.
+                                        quiet_streak = 0;
+                                        next_wait = base;
                                     }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "revocation list parse failed")
@@ -152,6 +198,7 @@ impl RevocationList {
                             tracing::warn!(error = %e, "revocation list fetch failed")
                         }
                     }
+                    next_at = Instant::now() + next_wait;
                 }
             });
         } else {
