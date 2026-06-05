@@ -73,6 +73,97 @@ const VIEWER_PUBLIC_PATHS: &[&str] = &[
     "/robots.txt",
 ];
 
+/// Build the response-header `set` block that Caddy applies to every
+/// viewer-subdomain response. These are defense-in-depth headers
+/// hardening the viewer-ui-react bundle and any neko UI it loads
+/// against XSS, clickjacking, MIME confusion, and referrer leaks
+/// (security review W7).
+///
+/// Why set them HERE (Caddy edge) rather than in dun-api or the
+/// container: the viewer subdomain is the only origin the viewer
+/// page ever runs at. Centralising the policy at the proxy means a
+/// single point to audit, no per-route forgetting, and it survives
+/// container upgrades. The dun-api `helmet` plugin already sets
+/// near-identical headers for `api.<domain>`, so this just brings
+/// the viewer namespace to parity.
+///
+/// Header rationale:
+///
+///  * **Content-Security-Policy** — the viewer-ui-react bundle is
+///    a static SPA that talks ONLY to its own origin (`'self'`) for
+///    HTTP, WS, and the WebRTC signaling endpoint. We allow inline
+///    styles because Vite hash-injects critical CSS at build, and
+///    inline scripts because the bundle's runtime config splat
+///    (`window.__ENV__ = {...}`) lives in `index.html`. We do
+///    NOT allow `unsafe-eval` so a compromised dependency cannot
+///    construct functions from strings. `connect-src` covers fetch
+///    + XHR + WS + EventSource + Beacon; `media-src blob:` lets
+///    `<video>` play decoded WebRTC streams.
+///  * **X-Content-Type-Options: nosniff** — block MIME confusion
+///    where browsers second-guess `Content-Type` and execute a
+///    text file as JS.
+///  * **X-Frame-Options: DENY** — viewer page must NEVER be iframed
+///    by another site. Combined with `frame-ancestors 'none'` for
+///    browsers that prefer CSP, this is our clickjacking defense.
+///  * **Referrer-Policy: strict-origin-when-cross-origin** — when
+///    the viewer makes outbound calls (none today, but future neko
+///    plugins might), don't leak the URL path which could include
+///    profile-name hints.
+///  * **Permissions-Policy** — disable APIs the viewer never uses:
+///    geolocation, microphone except where neko explicitly grants
+///    it, payment, USB. Keeps a XSS payload from siphoning device
+///    sensors.
+///  * **Strict-Transport-Security** — Caddy emits this on the
+///    automatic-HTTPS layer when wildcard cert is in place, but we
+///    repeat it here with `max-age=31536000; includeSubDomains` so
+///    a future operator can't accidentally disable HSTS at the
+///    automation level without losing it on viewer subdomains too.
+fn viewer_response_security_headers() -> Value {
+    json!({
+        "set": {
+            // CSP — see the doc comment above for each directive's
+            // rationale. We use one consolidated header so Caddy
+            // doesn't emit two CSPs (browsers intersect them which
+            // produces hard-to-reason-about effective policies).
+            "Content-Security-Policy": [concat!(
+                "default-src 'self'; ",
+                "script-src 'self' 'unsafe-inline'; ",
+                "style-src 'self' 'unsafe-inline'; ",
+                "img-src 'self' data: blob:; ",
+                "media-src 'self' blob:; ",
+                "connect-src 'self' wss: https:; ",
+                "font-src 'self' data:; ",
+                "frame-ancestors 'none'; ",
+                "form-action 'self'; ",
+                "base-uri 'self'; ",
+                "object-src 'none'; ",
+                "worker-src 'self' blob:",
+            )],
+            "X-Content-Type-Options": ["nosniff"],
+            "X-Frame-Options": ["DENY"],
+            "Referrer-Policy": ["strict-origin-when-cross-origin"],
+            "Permissions-Policy": [concat!(
+                "geolocation=(), ",
+                "microphone=(self), ",
+                "camera=(self), ",
+                "payment=(), ",
+                "usb=(), ",
+                "magnetometer=(), ",
+                "gyroscope=(), ",
+                "accelerometer=()",
+            )],
+            "Strict-Transport-Security": ["max-age=31536000; includeSubDomains"],
+            "Cross-Origin-Opener-Policy": ["same-origin"],
+            "Cross-Origin-Resource-Policy": ["same-origin"],
+        },
+        // `deferred: true` lets the headers apply even when the
+        // upstream returns its own `Content-Security-Policy` etc.
+        // We'd rather override (defense-in-depth) than let a
+        // misconfigured neko upstream punch a hole in our policy.
+        "deferred": true,
+    })
+}
+
 /// Compute the deterministic `@id` for a route, derived from host.
 ///
 /// Host already contains region + 16 char base36 random suffix so the @id is
@@ -115,7 +206,8 @@ pub fn build_route(
                     "X-Forwarded-Proto": ["{http.request.scheme}"],
                     "X-Forwarded-For": ["{http.request.remote.host}"],
                 }
-            }
+            },
+            "response": viewer_response_security_headers(),
         },
     });
 
@@ -158,7 +250,13 @@ pub fn build_route(
                                 "X-Forwarded-Proto": ["{http.request.scheme}"],
                                 "X-Forwarded-For": ["{http.request.remote.host}"],
                             }
-                        }
+                        },
+                        // Apply the same security-header set as the
+                        // tunnel handle. dun-api responds with JSON
+                        // for `/viewer/exchange` and friends; if a
+                        // future route ever returns HTML we still
+                        // want CSP / nosniff in front of it.
+                        "response": viewer_response_security_headers(),
                     },
                 }
             ],
@@ -198,6 +296,11 @@ pub fn build_route(
         // forwarding the body would prematurely consume the original
         // request. Caddy's reverse_proxy handles this when paired
         // with `rewrite.method=GET`.
+        //
+        // Security headers piggy-back on the gate handler so 401 /
+        // 503 responses also carry CSP / nosniff / frame-ancestors.
+        // Without this a gate-generated error page would still be
+        // sniffable / iframable, defeating the whole hardening pass.
         let auth_handle = json!({
             "handle": [{
                 "handler": "reverse_proxy",
@@ -213,7 +316,8 @@ pub fn build_route(
                             "X-Forwarded-Method": ["{http.request.method}"],
                             "X-Forwarded-Uri": ["{http.request.uri}"]
                         }
-                    }
+                    },
+                    "response": viewer_response_security_headers(),
                 },
                 "handle_response": [
                     {
@@ -271,6 +375,18 @@ pub fn build_session_ended_route(id: &str, host_pattern: &str) -> Value {
                         "set": {
                             "Content-Type": ["text/html; charset=utf-8"],
                             "Cache-Control": ["no-store"],
+                            // Apply the same hardening to the 410
+                            // page itself — without it the static
+                            // body could be iframed by a malicious
+                            // site to fingerprint share-tunnel
+                            // domains, or sniffed if a CDN
+                            // mid-stream rewrites the Content-Type.
+                            "Content-Security-Policy": [
+                                "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+                            ],
+                            "X-Content-Type-Options": ["nosniff"],
+                            "X-Frame-Options": ["DENY"],
+                            "Referrer-Policy": ["no-referrer"],
                         }
                     }
                 }, {
@@ -431,9 +547,77 @@ mod tests {
             inner[0]["response"]["set"]["Cache-Control"][0],
             "no-store"
         );
+        // Security headers attached to the 410 page.
+        assert_eq!(inner[0]["response"]["set"]["X-Frame-Options"][0], "DENY");
+        assert_eq!(
+            inner[0]["response"]["set"]["X-Content-Type-Options"][0],
+            "nosniff"
+        );
+        assert!(
+            inner[0]["response"]["set"]["Content-Security-Policy"][0]
+                .as_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'"),
+        );
         assert_eq!(inner[1]["handler"], "static_response");
         assert_eq!(inner[1]["status_code"], 410);
         let body = inner[1]["body"].as_str().unwrap();
         assert!(body.contains("Session ended"));
+    }
+
+    #[test]
+    fn build_route_attaches_security_headers_to_tunnel_response() {
+        let r = CaddyRoute {
+            host: "abc.sin.dun-studio.xyz".into(),
+            upstream: "127.0.0.1:11042".into(),
+            ws_paths: vec![],
+        };
+        let v = build_route(&r, None, None);
+        let inner = &v["handle"][0]["routes"];
+        let response_headers = &inner[0]["handle"][0]["headers"]["response"]["set"];
+
+        // CSP must include `frame-ancestors 'none'` (clickjacking
+        // defense — equivalent to X-Frame-Options: DENY for modern
+        // browsers).
+        let csp = response_headers["Content-Security-Policy"][0]
+            .as_str()
+            .unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "csp = {csp}");
+        assert!(csp.contains("default-src 'self'"), "csp = {csp}");
+        assert!(csp.contains("object-src 'none'"), "csp = {csp}");
+
+        assert_eq!(response_headers["X-Content-Type-Options"][0], "nosniff");
+        assert_eq!(response_headers["X-Frame-Options"][0], "DENY");
+        assert_eq!(
+            response_headers["Referrer-Policy"][0],
+            "strict-origin-when-cross-origin"
+        );
+        assert!(response_headers["Strict-Transport-Security"][0]
+            .as_str()
+            .unwrap()
+            .contains("max-age=31536000"));
+    }
+
+    #[test]
+    fn build_route_with_auth_gate_applies_security_headers_on_gate_response_too() {
+        let r = CaddyRoute {
+            host: "abc.sin.dun-studio.xyz".into(),
+            upstream: "127.0.0.1:11042".into(),
+            ws_paths: vec![],
+        };
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"));
+        let inner = v["handle"][0]["routes"].as_array().unwrap();
+        // Auth-gated handle is the third entry (api split + public
+        // assets first).
+        let auth_handle = &inner[2]["handle"][0];
+        let response_headers = &auth_handle["headers"]["response"]["set"];
+        assert!(
+            response_headers["Content-Security-Policy"][0]
+                .as_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'"),
+            "auth gate response missing frame-ancestors directive"
+        );
+        assert_eq!(response_headers["X-Frame-Options"][0], "DENY");
     }
 }
