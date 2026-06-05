@@ -228,6 +228,20 @@ pub fn build_route(
         "headers": {
             "request": {
                 "set": {
+                    // Pin Host explicitly to the share subdomain. Caddy's
+                    // reverse_proxy default preserves the original client
+                    // Host, which is fine in the normal case (Host already
+                    // matches `route.host`). The explicit set defends
+                    // against an attacker who hand-crafts an HTTP request
+                    // to `https://<sub>:8443` with `Host: localhost` —
+                    // even if Caddy's host matcher accepted such a
+                    // request (it shouldn't; matchers also key on Host),
+                    // the upstream container would receive
+                    // `Host: <sub>.<region>.<domain>` and the
+                    // loopback-only middleware would treat it as
+                    // remote. Belt-and-suspenders for the view-only
+                    // boundary on the container side.
+                    "Host": [route.host.clone()],
                     "X-Forwarded-Host": ["{http.request.host}"],
                     "X-Forwarded-Proto": ["{http.request.scheme}"],
                     "X-Forwarded-For": ["{http.request.remote.host}"],
