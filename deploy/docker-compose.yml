@@ -75,3 +75,44 @@ services:
     command: ["--server", "/state/rathole/server.toml"]
     volumes:
       - ../state/rathole:/state/rathole:ro
+
+  # Stateless EdDSA cookie-auth sidecar. Caddy `forward_auth` calls
+  # `127.0.0.1:9444/check` on every viewer subdomain request that
+  # isn't a public asset or a dun-api split-route endpoint. The
+  # sidecar verifies the `dun_v` cookie against JWKS pulled from
+  # dun-api (24h refresh) plus a revocation list polled every 5s.
+  # No per-request round-trip to dun-api → keeps the global 10k req/s
+  # rate limit free for actual API traffic.
+  edge-viewer-gate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.edge-viewer-gate
+    image: dun-tunel/edge-viewer-gate:latest
+    container_name: edge-viewer-gate
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      BIND_ADDR: "127.0.0.1:9444"
+      # JWKS URL = dun-api `/api/viewer/jwks` reachable via the host
+      # network namespace. In production this typically goes through
+      # the public api.<domain> (TLS) so a misconfigured loopback
+      # doesn't accidentally fall back to plaintext on the Internet.
+      # For dev / staging without a stable domain, point at the
+      # dun-api container's loopback port directly.
+      JWKS_URL: ${VIEWER_GATE_JWKS_URL:-${DUN_API_ENDPOINT}/viewer/jwks}
+      JWKS_REFRESH_SECONDS: ${VIEWER_GATE_JWKS_REFRESH_SECONDS:-86400}
+      # Revocation list polling — share the same edge-callback API
+      # key so dun-api can recognize the puller. Optional; without
+      # it the sidecar still verifies signatures but jti revocation
+      # only takes effect after the cookie's natural 10-minute TTL.
+      REVOCATION_URL: ${VIEWER_GATE_REVOCATION_URL:-${DUN_API_ENDPOINT}/tunnels/revoked-jtis}
+      REVOCATION_API_KEY: ${DUN_API_KEY:-}
+      REVOCATION_POLL_SECONDS: ${VIEWER_GATE_REVOCATION_POLL_SECONDS:-5}
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9444/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - edge-control

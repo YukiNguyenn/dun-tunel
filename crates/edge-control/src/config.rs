@@ -29,6 +29,14 @@ pub struct EdgeConfig {
     /// Required when `share_tunnel_domain` is set so Caddy can
     /// satisfy the DNS-01 challenge.
     pub cloudflare_api_token: Option<String>,
+    /// Optional `host:port` of the `edge-viewer-gate` sidecar, as seen
+    /// from inside the Caddy container's loopback. When `Some`, every
+    /// per-session viewer route installs a `forward_auth` block in
+    /// front of the rathole tunnel so non-public-asset requests must
+    /// pass an EdDSA cookie verification before reaching the
+    /// container's WS / HTTP endpoints. When `None`, viewer subdomains
+    /// stay open to anyone with the URL — only acceptable for dev.
+    pub viewer_gate_upstream: Option<String>,
 }
 
 impl EdgeConfig {
@@ -64,6 +72,21 @@ impl EdgeConfig {
 
         let share_tunnel_domain = std::env::var("SHARE_TUNNEL_DOMAIN").ok();
         let cloudflare_api_token = std::env::var("CLOUDFLARE_API_TOKEN").ok();
+        // Default to the canonical loopback `127.0.0.1:9444` matching
+        // the `edge-viewer-gate` sidecar bind address. Operators can
+        // override with `EDGE_VIEWER_GATE_UPSTREAM=disabled` to skip
+        // the auth gate entirely (dev / staging without the sidecar
+        // running) — any falsy value disables the forward_auth shim.
+        let viewer_gate_upstream = std::env::var("EDGE_VIEWER_GATE_UPSTREAM")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| {
+                !s.is_empty()
+                    && !s.eq_ignore_ascii_case("disabled")
+                    && !s.eq_ignore_ascii_case("off")
+                    && !s.eq_ignore_ascii_case("none")
+            })
+            .or_else(|| Some("127.0.0.1:9444".to_string()));
 
         Ok(Self {
             region,
@@ -81,6 +104,7 @@ impl EdgeConfig {
             jwt_secret_v2,
             share_tunnel_domain,
             cloudflare_api_token,
+            viewer_gate_upstream,
         })
     }
 }

@@ -1,0 +1,47 @@
+[package]
+name = "edge-viewer-gate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = """
+On-edge sidecar that authorizes every viewer-facing HTTP request
+against the cookie JWT (EdDSA). Caddy `forward_auth` proxies HEAD
+requests here; we verify the cookie statelessly using the JWKS
+fetched from dun-api. No round-trip to dun-api per request keeps
+this off the global rate limit and decouples viewer availability
+from dun-api uptime.
+"""
+
+[[bin]]
+name = "edge-viewer-gate"
+path = "src/main.rs"
+
+[dependencies]
+edge-shared = { path = "../edge-shared" }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+jsonwebtoken = { workspace = true }
+dashmap = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+# base64 decoding for JWKS `x` field — already pulled in transitively
+# via jsonwebtoken but request explicitly so we own the version.
+base64 = "0.22"
+
+[dev-dependencies]
+wiremock = "0.6"

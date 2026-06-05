@@ -29,18 +29,42 @@ struct AdminClientInner {
     /// page (R9.4 cookie domain pinning). When `None`, we fall back
     /// to the legacy "everything goes through the tunnel" shape.
     dun_api_upstream: Option<String>,
+    /// Optional `host:port` of the `edge-viewer-gate` sidecar as seen
+    /// from the Caddy container loopback. When `Some`, every
+    /// non-public-asset / non-dun-api request on a viewer subdomain
+    /// is `forward_auth`'d to `<gate>/check`; only 2xx responses
+    /// pass through to the rathole tunnel. When `None`, the auth
+    /// check is skipped (legacy / dev shape — viewer subdomains are
+    /// open to anyone with the URL).
+    auth_gate_upstream: Option<String>,
     routes: DashMap<String, CaddyRoute>,
     http: reqwest::Client,
 }
 
 impl AdminClient {
     pub fn new(base_url: String) -> Self {
-        Self::with_dun_api(base_url, None)
+        Self::with_upstreams(base_url, None, None)
     }
 
     /// Build an `AdminClient` that knows where to find dun-api so it
     /// can install split-route blocks for viewer-cookie endpoints.
+    /// Auth gate is left disabled — use [`with_upstreams`] to enable
+    /// the cookie auth sidecar.
     pub fn with_dun_api(base_url: String, dun_api_upstream: Option<String>) -> Self {
+        Self::with_upstreams(base_url, dun_api_upstream, None)
+    }
+
+    /// Build an `AdminClient` that knows where to find both dun-api
+    /// (for cookie-bearing viewer endpoints) and the
+    /// `edge-viewer-gate` sidecar (for stateless cookie auth on every
+    /// non-public viewer-subdomain request). This is the shape we
+    /// use in production; tests / dev fall back to the older
+    /// constructors.
+    pub fn with_upstreams(
+        base_url: String,
+        dun_api_upstream: Option<String>,
+        auth_gate_upstream: Option<String>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -49,6 +73,7 @@ impl AdminClient {
             inner: Arc::new(AdminClientInner {
                 base_url,
                 dun_api_upstream,
+                auth_gate_upstream,
                 routes: DashMap::new(),
                 http,
             }),
@@ -83,7 +108,11 @@ impl AdminClient {
     /// us an explicit before/after snapshot we can verify.
     pub async fn add_route(&self, route: CaddyRoute) -> EdgeResult<()> {
         let id = route_id(&route.host);
-        let body = build_route(&route, self.inner.dun_api_upstream.as_deref());
+        let body = build_route(
+            &route,
+            self.inner.dun_api_upstream.as_deref(),
+            self.inner.auth_gate_upstream.as_deref(),
+        );
 
         // Attempt 1: PUT /id/<route_id> for in-place update.
         let id_url = format!("{}/id/{}", self.inner.base_url, id);

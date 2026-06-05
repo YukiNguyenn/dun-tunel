@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+# Multi-stage build for edge-viewer-gate binary.
+#
+# edge-viewer-gate is a tiny stateless EdDSA cookie-auth sidecar (~4 MB
+# binary) that Caddy `forward_auth` calls before proxying viewer
+# subdomain traffic into the rathole tunnel. It pulls JWKS from
+# dun-api once every 24h and a revocation list every 60s — no DB,
+# no network exposure outside the loopback.
+#
+# Build is intentionally separate from edge-control because:
+#   - edge-control depends on mediasoup-sys (Python + meson + C++)
+#     which adds ~5 minutes to a cold build,
+#   - edge-viewer-gate has only pure-Rust deps (axum, jsonwebtoken,
+#     reqwest, redis), so building it independently shrinks the
+#     critical path of any cookie-auth-only change to ~30s.
+#
+# Cache mounts shared with the edge-control Dockerfile via the same
+# Cargo registry + target paths, so the second image of a given
+# `docker compose build` reuses crate downloads.
+
+FROM rust:1.88-bookworm AS builder
+WORKDIR /build
+
+# No native deps — pure Rust dependencies.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add rustfmt
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+
+ENV CARGO_BUILD_JOBS=2
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p edge-viewer-gate --bin edge-viewer-gate \
+    && cp /build/target/release/edge-viewer-gate /usr/local/bin/edge-viewer-gate
+
+# Runtime stage — slim Debian, only ca-certificates needed for HTTPS
+# requests to dun-api (JWKS + revocation list polling).
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       libstdc++6 \
+       libgcc-s1 \
+       curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/edge-viewer-gate /usr/local/bin/edge-viewer-gate
+
+RUN groupadd --system --gid 1501 gate \
+    && useradd --system --uid 1501 --gid 1501 \
+       --no-create-home --shell /usr/sbin/nologin gate
+
+USER gate
+# Bind on 9444 inside the host network namespace. Caddy reaches it via
+# `127.0.0.1:9444/check` for forward_auth — never expose externally,
+# the binary speaks plain HTTP and trusts every client on loopback.
+EXPOSE 9444
+ENTRYPOINT ["/usr/local/bin/edge-viewer-gate"]

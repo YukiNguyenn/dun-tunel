@@ -59,7 +59,20 @@ impl AppState {
                  because Caddy will route `/viewer/exchange` into the rathole tunnel instead of dun-api"
             );
         }
-        let caddy = AdminClient::with_dun_api(cfg.caddy_admin_url.clone(), dun_api_upstream);
+        let auth_gate_upstream = cfg.viewer_gate_upstream.clone();
+        if auth_gate_upstream.is_none() {
+            tracing::warn!(
+                "EDGE_VIEWER_GATE_UPSTREAM disabled — viewer subdomains will NOT enforce cookie auth. \
+                 Anyone with the URL can hit the container's WS / HTTP endpoints. Dev mode only."
+            );
+        } else if let Some(ref gate) = auth_gate_upstream {
+            tracing::info!(%gate, "viewer cookie auth gate enabled (forward_auth → edge-viewer-gate)");
+        }
+        let caddy = AdminClient::with_upstreams(
+            cfg.caddy_admin_url.clone(),
+            dun_api_upstream,
+            auth_gate_upstream,
+        );
 
         // Bootstrap the wildcard TLS policy when both domain + CF
         // token are configured. This replaces the `*.<region>.<domain>:8443`
