@@ -95,12 +95,47 @@ async fn check_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Tracing-friendly summary of the incoming sub-request. Caddy
+    // forwards `Cookie` + `X-Forwarded-Host` + `X-Forwarded-Method` +
+    // `X-Forwarded-Uri` so we can correlate gate decisions with the
+    // original request the viewer made. We log header presence (not
+    // values) so cookies don't leak into the log stream.
+    let xfh = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
+    let xfu = headers
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
+    let has_cookie = headers.get("cookie").is_some();
+    tracing::info!(
+        forwarded_host = %xfh,
+        forwarded_uri = %xfu,
+        cookie_present = has_cookie,
+        "/check received"
+    );
     match verify::authorize(&headers, &state.jwks, &state.revocation).await {
-        Ok(_claims) => StatusCode::OK,
+        Ok(claims) => {
+            tracing::info!(
+                forwarded_host = %xfh,
+                jti = %claims.jti,
+                sub = %claims.sub,
+                "/check 200"
+            );
+            StatusCode::OK
+        }
         Err(reason) => {
-            // Verbose debug log on failure helps operators distinguish
-            // a misconfigured cookie domain from a real attack pattern.
-            tracing::debug!(?reason, "viewer cookie rejected");
+            // Promote rejection to `info` so default `RUST_LOG=info`
+            // operators see WHY a 401 happened. The reason variants
+            // are bounded (no user input echoed) so log bloat is
+            // capped — at most one line per failed sub-request.
+            tracing::info!(
+                forwarded_host = %xfh,
+                forwarded_uri = %xfu,
+                reason = %reason,
+                "/check 401"
+            );
             StatusCode::UNAUTHORIZED
         }
     }
