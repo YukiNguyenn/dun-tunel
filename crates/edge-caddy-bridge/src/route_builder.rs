@@ -36,6 +36,32 @@ const DUN_API_PATH_PREFIXES: &[&str] = &[
     "/viewer/jwks",
 ];
 
+/// Path patterns that MUST be hard-blocked at the edge, regardless of
+/// auth gate decisions, when accessed via a public viewer subdomain.
+///
+/// Currently: the host-mode SPA shell (`/host*`). The dun-browser
+/// container API maps the same `index.html` bundle to both `/viewer`
+/// and `/host`, distinguished only by URL path inside the JS. Without
+/// this block, a viewer with a valid cookie could navigate to
+/// `https://<sub>:8443/host` and the frontend would render the
+/// host-mode UI (including mouse/keyboard handlers, settings panel,
+/// etc.). The container's loopback middleware would then refuse the
+/// follow-up control-plane API calls — so the user wouldn't actually
+/// gain control — but the UI would still light up the input
+/// affordances and confuse the threat model.
+///
+/// Belt-and-suspenders: 403 at the edge means the host UI never
+/// loads on a public subdomain. Tied with the container loopback
+/// gate, an attacker who reverse-engineers the bundle and re-hosts
+/// it cannot connect their JS to the live container API either.
+///
+/// Add new patterns here for any future host-only paths that get
+/// added to the container API.
+const VIEWER_EDGE_BLOCK_PATHS: &[&str] = &[
+    "/host",
+    "/host/*",
+];
+
 /// Path patterns that bypass the cookie auth check entirely.
 ///
 /// These are static viewer-ui-react bundle assets. The HTML at
@@ -218,11 +244,38 @@ pub fn build_route(
     //
     // Caddy evaluates entries top-to-bottom and stops at the first
     // match. Order matters:
-    //   1. dun-api endpoints (most specific path matchers)
-    //   2. public assets (viewer-ui-react bundle)
-    //   3. forward_auth → tunnel (when auth_gate set)
-    //   4. tunnel default (test / dev fallback)
+    //   1. Hard-block paths (host-mode SPA, etc.) — 403 with body
+    //      explaining why, BEFORE any other handler runs.
+    //   2. dun-api endpoints (most specific path matchers)
+    //   3. public assets (viewer-ui-react bundle)
+    //   4. forward_auth → tunnel (when auth_gate set)
+    //   5. tunnel default (test / dev fallback)
     let mut inner_routes: Vec<Value> = Vec::new();
+
+    // Hard-block /host* on every public viewer subdomain. Defense-
+    // in-depth: even if Caddy auth gate or a future config drift
+    // would let the request through, this static_response 403
+    // prevents the host SPA shell from ever loading on a public
+    // subdomain. The static body explains what happened so a
+    // confused user can act on it (request the owner to share an
+    // updated link or reload from a fresh fragment).
+    let hard_block = json!({
+        "match": [{
+            "path": VIEWER_EDGE_BLOCK_PATHS.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+        }],
+        "handle": [{
+            "handler": "static_response",
+            "status_code": 403,
+            "headers": {
+                "Content-Type": ["text/plain; charset=utf-8"],
+                "Cache-Control": ["no-store"],
+                "X-Content-Type-Options": ["nosniff"],
+                "X-Frame-Options": ["DENY"],
+            },
+            "body": EDGE_BLOCK_HOST_BODY,
+        }],
+    });
+    inner_routes.push(hard_block);
 
     if let Some(api_upstream) = dun_api_upstream {
         // Rewrite the path so `/viewer/exchange` becomes
@@ -416,6 +469,18 @@ font-family:ui-monospace,monospace;font-size:.9em}</style></head>\
 Hãy yêu cầu họ tạo phiên mới nếu bạn cần truy cập tiếp.</p>\
 </main></body></html>";
 
+/// Plain-text body for `/host*` 403 on public viewer subdomains.
+/// Kept short and explanation-focused — anyone landing here either
+/// (a) clicked a stale link expecting host control or (b) tried to
+/// probe whether the public surface exposes the host SPA. Either
+/// way, telling them clearly what happened is more useful than a
+/// generic 403 page.
+const EDGE_BLOCK_HOST_BODY: &str =
+    "403 Forbidden\n\nThe `/host` route is local-only and cannot be \
+accessed via a public share link. Only the device that owns this \
+profile can open the host UI. If you received a share link, please \
+use the `/viewer/` URL the owner sent you.\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +514,9 @@ mod tests {
         };
         let v = build_route(&r, Some("127.0.0.1:3010"), None);
         let inner = &v["handle"][0]["routes"];
-        let api_paths = inner[0]["match"][0]["path"].as_array().unwrap();
+        // Index 0 is now the hard-block /host entry; api split is at
+        // index 1.
+        let api_paths = inner[1]["match"][0]["path"].as_array().unwrap();
         let paths: Vec<String> = api_paths
             .iter()
             .map(|p| p.as_str().unwrap().to_string())
@@ -457,7 +524,7 @@ mod tests {
         assert!(paths.iter().any(|p| p == "/viewer/exchange"));
         assert!(paths.iter().any(|p| p == "/viewer/exchange/*"));
         assert!(paths.iter().any(|p| p == "/viewer/refresh-cookie"));
-        let api_handles = inner[0]["handle"].as_array().unwrap();
+        let api_handles = inner[1]["handle"].as_array().unwrap();
         assert_eq!(api_handles[0]["handler"], "rewrite");
         assert_eq!(
             api_handles[0]["uri"],
@@ -468,9 +535,9 @@ mod tests {
             api_handles[1]["upstreams"][0]["dial"],
             "127.0.0.1:3010"
         );
-        // No auth gate → tail route is the tunnel upstream
+        // No auth gate → tail route is the tunnel upstream (idx 2).
         assert_eq!(
-            inner[1]["handle"][0]["upstreams"][0]["dial"],
+            inner[2]["handle"][0]["upstreams"][0]["dial"],
             "127.0.0.1:11042"
         );
     }
@@ -484,9 +551,10 @@ mod tests {
         };
         let v = build_route(&r, None, None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
-        assert_eq!(inner.len(), 1);
+        // Hard-block /host (idx 0) + tunnel default (idx 1) = 2 entries.
+        assert_eq!(inner.len(), 2);
         assert_eq!(
-            inner[0]["handle"][0]["upstreams"][0]["dial"],
+            inner[1]["handle"][0]["upstreams"][0]["dial"],
             "127.0.0.1:11042"
         );
     }
@@ -500,11 +568,12 @@ mod tests {
         };
         let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"));
         let inner = v["handle"][0]["routes"].as_array().unwrap();
-        // 0: dun-api split, 1: public assets, 2: auth-gated tunnel
-        assert_eq!(inner.len(), 3);
+        // 0: hard-block /host, 1: dun-api split, 2: public assets,
+        // 3: auth-gated tunnel.
+        assert_eq!(inner.len(), 4);
 
         // public asset bypass
-        let public_paths = inner[1]["match"][0]["path"].as_array().unwrap();
+        let public_paths = inner[2]["match"][0]["path"].as_array().unwrap();
         let paths: Vec<String> = public_paths
             .iter()
             .map(|p| p.as_str().unwrap().to_string())
@@ -513,8 +582,8 @@ mod tests {
         assert!(paths.iter().any(|p| p == "/static/*"));
         assert!(paths.iter().any(|p| p == "/assets/*"));
 
-        // forward_auth → tunnel
-        let auth_handle = &inner[2]["handle"][0];
+        // forward_auth → tunnel (idx 3)
+        let auth_handle = &inner[3]["handle"][0];
         assert_eq!(auth_handle["handler"], "reverse_proxy");
         assert_eq!(auth_handle["upstreams"][0]["dial"], "127.0.0.1:9444");
         assert_eq!(auth_handle["rewrite"]["uri"], "/check");
@@ -574,7 +643,9 @@ mod tests {
         };
         let v = build_route(&r, None, None);
         let inner = &v["handle"][0]["routes"];
-        let response_headers = &inner[0]["handle"][0]["headers"]["response"]["set"];
+        // [0] hard-block /host, [1] tunnel default. Security headers
+        // are on the tunnel handler.
+        let response_headers = &inner[1]["handle"][0]["headers"]["response"]["set"];
 
         // CSP must include `frame-ancestors 'none'` (clickjacking
         // defense — equivalent to X-Frame-Options: DENY for modern
@@ -607,9 +678,12 @@ mod tests {
         };
         let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"));
         let inner = v["handle"][0]["routes"].as_array().unwrap();
-        // Auth-gated handle is the third entry (api split + public
-        // assets first).
-        let auth_handle = &inner[2]["handle"][0];
+        // Inner route order with full wiring (api + assets + auth):
+        //   [0] hard-block /host (defense in depth)
+        //   [1] dun-api split (api routes)
+        //   [2] public assets bypass
+        //   [3] auth-gated tunnel
+        let auth_handle = &inner[3]["handle"][0];
         let response_headers = &auth_handle["headers"]["response"]["set"];
         assert!(
             response_headers["Content-Security-Policy"][0]
@@ -619,5 +693,37 @@ mod tests {
             "auth gate response missing frame-ancestors directive"
         );
         assert_eq!(response_headers["X-Frame-Options"][0], "DENY");
+    }
+
+    #[test]
+    fn build_route_hard_blocks_host_path_first() {
+        let r = CaddyRoute {
+            host: "abc.sin.dun-studio.xyz".into(),
+            upstream: "127.0.0.1:11042".into(),
+            ws_paths: vec![],
+        };
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"));
+        let inner = v["handle"][0]["routes"].as_array().unwrap();
+        // Hard-block must be first so Caddy returns 403 before any
+        // auth gate / dun-api / tunnel handler runs.
+        let block = &inner[0];
+        let block_paths = block["match"][0]["path"].as_array().unwrap();
+        let paths: Vec<String> = block_paths
+            .iter()
+            .map(|p| p.as_str().unwrap().to_string())
+            .collect();
+        assert!(paths.iter().any(|p| p == "/host"));
+        assert!(paths.iter().any(|p| p == "/host/*"));
+
+        let block_handle = &block["handle"][0];
+        assert_eq!(block_handle["handler"], "static_response");
+        assert_eq!(block_handle["status_code"], 403);
+        let body = block_handle["body"].as_str().unwrap();
+        assert!(body.contains("local-only"));
+        assert_eq!(
+            block_handle["headers"]["X-Content-Type-Options"][0],
+            "nosniff"
+        );
+        assert_eq!(block_handle["headers"]["X-Frame-Options"][0], "DENY");
     }
 }
