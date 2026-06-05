@@ -130,45 +130,15 @@ async fn fetch_jwks(url: &str) -> Result<HashMap<String, Arc<DecodingKey>>> {
             );
             continue;
         }
-        let key = DecodingKey::from_ed_der(&ed25519_raw_to_der(&raw));
+        // jsonwebtoken 9.x's `from_ed_der` passes the bytes straight
+        // through to ring's `ED25519_VERIFICATION_ALGORITHM`, which
+        // expects RAW 32-byte public keys — NOT SubjectPublicKeyInfo
+        // wrapped DER. Earlier versions of this code wrapped raw
+        // into DER which produced `InvalidSignature` on every verify.
+        // Confirmed against https://github.com/Keats/jsonwebtoken
+        // and ring's UnparsedPublicKey docs.
+        let key = DecodingKey::from_ed_der(&raw);
         out.insert(entry.kid, Arc::new(key));
     }
     Ok(out)
-}
-
-/// `jsonwebtoken::DecodingKey::from_ed_der` accepts a SubjectPublicKeyInfo
-/// DER. The 32-byte raw key needs to be wrapped in a fixed prefix:
-///
-///   30 2a 30 05 06 03 2b 65 70 03 21 00 <32 bytes>
-///
-/// where `06 03 2b 65 70` is the OID for Ed25519 (1.3.101.112).
-/// This avoids pulling a full ASN.1 encoder for what is effectively a
-/// constant prefix.
-fn ed25519_raw_to_der(raw: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(raw.len(), 32);
-    let mut out = Vec::with_capacity(44);
-    out.extend_from_slice(&[
-        0x30, 0x2a, // SEQUENCE (42 bytes)
-        0x30, 0x05, // SEQUENCE (5 bytes) — alg id
-        0x06, 0x03, 0x2b, 0x65, 0x70, // OID 1.3.101.112 (Ed25519)
-        0x03, 0x21, 0x00, // BIT STRING (33 bytes incl. leading 0x00)
-    ]);
-    out.extend_from_slice(raw);
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_to_der_has_expected_prefix() {
-        let raw = [0xAB; 32];
-        let der = ed25519_raw_to_der(&raw);
-        assert_eq!(der.len(), 44);
-        assert_eq!(&der[..12], &[
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ]);
-        assert_eq!(&der[12..], &raw);
-    }
 }
