@@ -4,13 +4,30 @@
 //! `GET <revocation_url>` every few seconds and replaces its local
 //! HashSet — verify becomes O(1) per request.
 //!
+//! Two operating modes (P0 hardening for Option E'):
+//!
+//!   * **Fail-OPEN** (default) — when polling fails, keep the last
+//!     known set in cache. Signature + exp checks still gate
+//!     cookies, so the worst case is a revoked-but-not-yet-expired
+//!     token surviving its 10-minute TTL window. Acceptable for
+//!     internal / closed-beta deployments.
+//!
+//!   * **Fail-CLOSED** (`REVOCATION_REQUIRED=true`) — when polling
+//!     fails for longer than `max_staleness`, the verifier starts
+//!     rejecting EVERY cookie until polling recovers. Used for
+//!     high-trust deployments where instant revocation matters more
+//!     than availability — `bandwidth force-revoke`, abuse take-down,
+//!     etc. The trade-off: a dun-api outage now visibly affects
+//!     viewers, but a leaked cookie cannot survive past detection.
+//!
 //! When `revocation_url` is not configured the list is permanently
-//! empty: signature + exp checks still gate cookies but already-
-//! issued tokens stay valid until natural expiry.
+//! empty AND `is_fresh()` returns `true` (we never expected to poll
+//! so there's nothing to be stale about). Strict mode is therefore a
+//! no-op when no URL is wired — operators must combine both knobs.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -22,20 +39,46 @@ struct RevokedListResponse {
     jtis: Vec<String>,
 }
 
+/// Inner mutable state. Wrapping in a single RwLock keeps the
+/// (set, last_success) update atomic so a verify call cannot read
+/// a fresh timestamp paired with a stale set or vice versa.
+struct Inner {
+    set: HashSet<String>,
+    /// `None` until the first successful poll. After that, the
+    /// `Instant` of the most recent successful poll. Used by
+    /// [`RevocationList::is_fresh`] to decide if strict-mode
+    /// verification should fail-CLOSED.
+    last_success: Option<Instant>,
+}
+
 #[derive(Clone)]
 pub struct RevocationList {
-    inner: Arc<RwLock<HashSet<String>>>,
+    inner: Arc<RwLock<Inner>>,
+    /// Cached configuration so [`is_fresh`] can return the right
+    /// answer even when no polling task is running (URL unset).
+    polling_enabled: bool,
+    max_staleness: Duration,
 }
 
 impl RevocationList {
     /// Spawn the polling task. Caller gets a clone-able handle that
     /// shares the inner set with the task.
+    ///
+    /// `max_staleness` is the strict-mode freshness threshold; only
+    /// consulted by the verifier when `REVOCATION_REQUIRED=true`.
+    /// Pass `Duration::MAX` to effectively disable strict mode at the
+    /// data-structure level (the verifier still has its own toggle).
     pub fn start(
         url: Option<String>,
         api_key: Option<String>,
         poll_interval: Duration,
+        max_staleness: Duration,
     ) -> Self {
-        let inner = Arc::new(RwLock::new(HashSet::new()));
+        let inner = Arc::new(RwLock::new(Inner {
+            set: HashSet::new(),
+            last_success: None,
+        }));
+        let polling_enabled = url.is_some();
 
         if let Some(url) = url {
             let inner_clone = inner.clone();
@@ -55,14 +98,23 @@ impl RevocationList {
                         Ok(resp) => match resp.error_for_status() {
                             Ok(resp) => match resp.json::<RevokedListResponse>().await {
                                 Ok(body) => {
-                                    let new: HashSet<String> = body.jtis.into_iter().collect();
-                                    *inner_clone.write().await = new;
+                                    let new: HashSet<String> =
+                                        body.jtis.into_iter().collect();
+                                    let mut guard = inner_clone.write().await;
+                                    guard.set = new;
+                                    guard.last_success = Some(Instant::now());
                                 }
-                                Err(e) => tracing::warn!(error = %e, "revocation list parse failed"),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "revocation list parse failed")
+                                }
                             },
-                            Err(e) => tracing::warn!(error = %e, "revocation list http error"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "revocation list http error")
+                            }
                         },
-                        Err(e) => tracing::warn!(error = %e, "revocation list fetch failed"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "revocation list fetch failed")
+                        }
                     }
                 }
             });
@@ -72,10 +124,68 @@ impl RevocationList {
             );
         }
 
-        Self { inner }
+        Self {
+            inner,
+            polling_enabled,
+            max_staleness,
+        }
     }
 
+    /// Returns `true` if the given jti is in the local revoked set.
     pub async fn contains(&self, jti: &str) -> bool {
-        self.inner.read().await.contains(jti)
+        self.inner.read().await.set.contains(jti)
+    }
+
+    /// Whether the local mirror is fresh enough to be trusted by
+    /// strict-mode verification.
+    ///
+    /// Returns `true` when:
+    ///   - polling is disabled (no URL configured) — there's nothing
+    ///     to be stale about; the verifier should not block on this,
+    ///   - OR a successful poll happened within `max_staleness`.
+    ///
+    /// Returns `false` when polling is enabled but every poll has
+    /// failed since startup, or the last success was longer ago than
+    /// `max_staleness`. Strict-mode verifier should reject in this
+    /// case.
+    pub async fn is_fresh(&self) -> bool {
+        if !self.polling_enabled {
+            return true;
+        }
+        match self.inner.read().await.last_success {
+            None => false,
+            Some(t) => t.elapsed() <= self.max_staleness,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn no_polling_url_means_always_fresh() {
+        let r = RevocationList::start(None, None, Duration::from_secs(1), Duration::from_secs(10));
+        assert!(r.is_fresh().await);
+        assert!(!r.contains("anything").await);
+    }
+
+    #[tokio::test]
+    async fn polling_url_starts_unfresh() {
+        // URL is junk so the poll task will fail; staleness window is
+        // a millisecond so the test doesn't have to wait. The point
+        // is: polling enabled + no successful poll yet => not fresh.
+        let r = RevocationList::start(
+            Some("http://127.0.0.1:1/never-listens".to_string()),
+            None,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        );
+        // Give the task a moment to run at least once and fail.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !r.is_fresh().await,
+            "polling enabled + no success should be unfresh"
+        );
     }
 }

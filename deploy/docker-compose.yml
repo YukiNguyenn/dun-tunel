@@ -108,6 +108,12 @@ services:
       REVOCATION_URL: ${VIEWER_GATE_REVOCATION_URL:-${DUN_API_ENDPOINT}/tunnels/revoked-jtis}
       REVOCATION_API_KEY: ${DUN_API_KEY:-}
       REVOCATION_POLL_SECONDS: ${VIEWER_GATE_REVOCATION_POLL_SECONDS:-5}
+      # Strict mode (P0 hardening). When `true`, sidecar rejects all
+      # cookies whenever the revocation feed is older than
+      # `REVOCATION_MAX_STALENESS_SECONDS`. Trades availability for
+      # instant revocation. See deploy/.env.example for details.
+      REVOCATION_REQUIRED: ${VIEWER_GATE_REVOCATION_REQUIRED:-false}
+      REVOCATION_MAX_STALENESS_SECONDS: ${VIEWER_GATE_REVOCATION_MAX_STALENESS_SECONDS:-30}
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:9444/healthz"]

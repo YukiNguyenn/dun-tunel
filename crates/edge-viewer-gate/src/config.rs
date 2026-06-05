@@ -33,6 +33,23 @@ pub struct Config {
 
     /// Poll interval for the revocation list. Default 5s.
     pub revocation_poll_interval: Duration,
+
+    /// Strict mode: when `true` the verifier rejects every cookie if
+    /// the revocation list is **stale** (last successful poll older
+    /// than `revocation_max_staleness`). Used for high-trust
+    /// deployments where a leaked cookie surviving its 10-minute
+    /// natural TTL is unacceptable. When `false` (default) a stale
+    /// list falls back to "no extra revocations known" — the cookie
+    /// signature + exp still gate access, so a fail-OPEN is no worse
+    /// than the cookie's TTL window.
+    pub revocation_required: bool,
+
+    /// Max age (seconds) of the last successful revocation poll
+    /// before strict mode trips and starts rejecting. Should be a
+    /// small multiple of `revocation_poll_interval` so transient
+    /// hiccups don't immediately fail-CLOSED. Default 30s
+    /// (= 6× the default 5s poll).
+    pub revocation_max_staleness: Duration,
 }
 
 impl Config {
@@ -58,6 +75,21 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(5));
+        // Default OFF for backward compat with dev / staging stacks
+        // that don't run a revocation feed. Set to "true"/"1"/"yes"
+        // in production where instant revocation is required.
+        let revocation_required = std::env::var("REVOCATION_REQUIRED")
+            .ok()
+            .map(|s| {
+                let s = s.trim().to_ascii_lowercase();
+                s == "true" || s == "1" || s == "yes" || s == "on"
+            })
+            .unwrap_or(false);
+        let revocation_max_staleness = std::env::var("REVOCATION_MAX_STALENESS_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(30));
 
         Ok(Self {
             bind_addr,
@@ -66,6 +98,8 @@ impl Config {
             revocation_url,
             revocation_api_key,
             revocation_poll_interval,
+            revocation_required,
+            revocation_max_staleness,
         })
     }
 }

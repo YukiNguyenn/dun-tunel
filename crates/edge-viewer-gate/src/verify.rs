@@ -40,6 +40,11 @@ pub enum AuthError {
     HostMismatch { got: String, expected: String },
     #[error("token revoked: {0}")]
     Revoked(String),
+    /// Strict-mode only: revocation list has not been refreshed
+    /// recently enough to trust verification. Reject EVERY cookie
+    /// until the upstream poll recovers.
+    #[error("revocation list stale (strict mode)")]
+    RevocationStale,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,7 +62,16 @@ pub async fn authorize(
     headers: &HeaderMap,
     jwks: &JwksCache,
     revocation: &RevocationList,
+    revocation_required: bool,
 ) -> Result<CookieClaims, AuthError> {
+    // Strict-mode pre-check: if the operator demands fresh
+    // revocation data, refuse to verify anything when the local
+    // mirror is stale. Done BEFORE signature verification because
+    // there's no point spending CPU on a token we'd reject anyway.
+    if revocation_required && !revocation.is_fresh().await {
+        return Err(AuthError::RevocationStale);
+    }
+
     let cookie_raw = headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())

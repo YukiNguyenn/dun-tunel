@@ -46,6 +46,11 @@ use revocation::RevocationList;
 pub struct AppState {
     pub jwks: JwksCache,
     pub revocation: RevocationList,
+    /// When `true`, the verifier rejects every cookie whenever the
+    /// local revocation mirror is stale. Surfaces operator intent
+    /// for high-trust deployments (instant revocation > availability).
+    /// Forwarded from `Config::revocation_required`.
+    pub revocation_required: bool,
 }
 
 #[tokio::main]
@@ -59,7 +64,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    tracing::info!(?cfg.bind_addr, jwks_url = %cfg.jwks_url, "edge-viewer-gate starting");
+    tracing::info!(
+        ?cfg.bind_addr,
+        jwks_url = %cfg.jwks_url,
+        revocation_required = cfg.revocation_required,
+        "edge-viewer-gate starting",
+    );
 
     // Initial JWKS fetch — fail loud if it can't, otherwise the gate
     // would block every request silently.
@@ -68,9 +78,26 @@ async fn main() -> anyhow::Result<()> {
         cfg.revocation_url.clone(),
         cfg.revocation_api_key.clone(),
         cfg.revocation_poll_interval,
+        cfg.revocation_max_staleness,
     );
 
-    let state = AppState { jwks, revocation };
+    if cfg.revocation_required && cfg.revocation_url.is_none() {
+        // Operator wanted strict mode but didn't wire a URL. The
+        // freshness check would otherwise short-circuit to "fresh"
+        // (no polling expected) and silently downgrade to fail-OPEN.
+        // Flag this loudly at boot so misconfiguration shows up in
+        // logs / health rather than only when an attacker abuses the
+        // gap.
+        tracing::error!(
+            "REVOCATION_REQUIRED=true but REVOCATION_URL not set — strict mode is INEFFECTIVE without polling"
+        );
+    }
+
+    let state = AppState {
+        jwks,
+        revocation,
+        revocation_required: cfg.revocation_required,
+    };
     let app = Router::new()
         .route("/check", get(check_handler))
         .route("/healthz", get(|| async { StatusCode::OK }))
@@ -115,7 +142,9 @@ async fn check_handler(
         cookie_present = has_cookie,
         "/check received"
     );
-    match verify::authorize(&headers, &state.jwks, &state.revocation).await {
+    match verify::authorize(&headers, &state.jwks, &state.revocation, state.revocation_required)
+        .await
+    {
         Ok(claims) => {
             tracing::info!(
                 forwarded_host = %xfh,
@@ -126,6 +155,16 @@ async fn check_handler(
             StatusCode::OK
         }
         Err(reason) => {
+            // Distinguish "cookie bad" (401) from "we cannot decide
+            // right now because revocation feed is stale" (503).
+            // 503 prompts Caddy / the viewer-ui to surface a
+            // "service unavailable" UX rather than the
+            // session-ended-guard reload, which would just loop
+            // until the feed recovers.
+            let status = match &reason {
+                verify::AuthError::RevocationStale => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::UNAUTHORIZED,
+            };
             // Promote rejection to `info` so default `RUST_LOG=info`
             // operators see WHY a 401 happened. The reason variants
             // are bounded (no user input echoed) so log bloat is
@@ -134,9 +173,10 @@ async fn check_handler(
                 forwarded_host = %xfh,
                 forwarded_uri = %xfu,
                 reason = %reason,
-                "/check 401"
+                status = status.as_u16(),
+                "/check rejected"
             );
-            StatusCode::UNAUTHORIZED
+            status
         }
     }
 }
