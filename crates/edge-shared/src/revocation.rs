@@ -36,6 +36,12 @@ impl HttpRevocationOracle {
             .timeout(Duration::from_secs(2))
             .build()
             .expect("reqwest client build");
+        // Normalise so callers can pass either `http://host:3010` or
+        // `http://host:3010/api`. dun-api mounts every route under
+        // `/api` (Elysia autoload). Mismatches show up as 404s in
+        // production logs — apply the same fix as
+        // `edge-callback-client::Client::normalise_endpoint`.
+        let endpoint = normalise_dun_api_endpoint(&endpoint);
         Self {
             endpoint,
             api_key,
@@ -118,5 +124,53 @@ impl RevocationOracle for HttpRevocationOracle {
         let revoked = self.fetch(jti).await?;
         self.cache_put(jti, revoked).await;
         Ok(revoked)
+    }
+}
+
+/// Normalise a `DUN_API_ENDPOINT` so it ends in `/api`. dun-api
+/// mounts every route under that prefix via Elysia autoload, so an
+/// operator who passes `http://host:3010` (no path) would otherwise
+/// get 404 on every call. We strip a trailing slash and append
+/// `/api` only when the path doesn't already end with it.
+///
+/// Mirrors `edge_callback_client::client::normalise_endpoint`. Kept
+/// duplicated rather than extracted because both crates target
+/// different layers of the dependency graph and a shared util
+/// crate isn't justified for ~10 lines.
+fn normalise_dun_api_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/api") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api")
+    }
+}
+
+#[cfg(test)]
+mod normalise_tests {
+    use super::normalise_dun_api_endpoint;
+
+    #[test]
+    fn appends_api_when_missing() {
+        assert_eq!(
+            normalise_dun_api_endpoint("http://localhost:3010"),
+            "http://localhost:3010/api"
+        );
+        assert_eq!(
+            normalise_dun_api_endpoint("http://localhost:3010/"),
+            "http://localhost:3010/api"
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_api_suffix() {
+        assert_eq!(
+            normalise_dun_api_endpoint("https://api.dun-studio.xyz/api"),
+            "https://api.dun-studio.xyz/api"
+        );
+        assert_eq!(
+            normalise_dun_api_endpoint("https://api.dun-studio.xyz/api/"),
+            "https://api.dun-studio.xyz/api"
+        );
     }
 }

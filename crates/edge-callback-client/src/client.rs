@@ -14,6 +14,31 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Normalise the dun-api endpoint URL so the callback path is always
+/// `<base>/tunnels/edge-callback` reachable.
+///
+/// dun-api mounts every route under `/api` via Elysia's autoload
+/// `prefix: 'api'`. Operators historically configured both forms:
+///
+///   - `http://localhost:3010`        ← bare host:port
+///   - `http://localhost:3010/api`    ← path included
+///   - `https://api.dun-studio.xyz/api` ← prod fronted by reverse proxy
+///
+/// The early callback URL builder did `format!("{}/tunnels/edge-callback")`
+/// directly. Operators using the bare form got 404 silently because
+/// the request went to `/tunnels/edge-callback` instead of
+/// `/api/tunnels/edge-callback`. We now detect the missing prefix
+/// once at client construction and append it. If the endpoint
+/// already ends with `/api` (or `/api/`), it is left alone.
+fn normalise_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/api") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api")
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
@@ -45,9 +70,17 @@ impl Client {
                 "DUN_API_KEY not set — edge → dun-api callbacks will 401 (dev mode only)"
             );
         }
+        let normalised = normalise_endpoint(&endpoint);
+        if normalised != endpoint {
+            tracing::info!(
+                raw = %endpoint,
+                normalised = %normalised,
+                "normalised DUN_API_ENDPOINT — appended `/api` so callbacks reach Elysia routes"
+            );
+        }
         Self {
             inner: Arc::new(ClientInner {
-                endpoint,
+                endpoint: normalised,
                 http,
                 queue_dir,
                 api_key,
@@ -90,5 +123,47 @@ impl Client {
         // TODO Phase 2: write to file in queue_dir for retry by background task
         let _ = &self.inner.queue_dir;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalise_endpoint;
+
+    #[test]
+    fn normalise_endpoint_appends_api_when_missing() {
+        assert_eq!(
+            normalise_endpoint("http://localhost:3010"),
+            "http://localhost:3010/api"
+        );
+        assert_eq!(
+            normalise_endpoint("http://localhost:3010/"),
+            "http://localhost:3010/api"
+        );
+    }
+
+    #[test]
+    fn normalise_endpoint_preserves_explicit_api_suffix() {
+        assert_eq!(
+            normalise_endpoint("http://localhost:3010/api"),
+            "http://localhost:3010/api"
+        );
+        // Trailing slash trimmed, but the `/api` part stays.
+        assert_eq!(
+            normalise_endpoint("http://localhost:3010/api/"),
+            "http://localhost:3010/api"
+        );
+    }
+
+    #[test]
+    fn normalise_endpoint_handles_https_with_subdomain() {
+        assert_eq!(
+            normalise_endpoint("https://api.dun-studio.xyz"),
+            "https://api.dun-studio.xyz/api"
+        );
+        assert_eq!(
+            normalise_endpoint("https://api.dun-studio.xyz/api"),
+            "https://api.dun-studio.xyz/api"
+        );
     }
 }
