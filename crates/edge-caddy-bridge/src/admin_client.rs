@@ -126,26 +126,16 @@ impl AdminClient {
 
         // Attempt 1: PUT /id/<route_id> for in-place update.
         let id_url = format!("{}/id/{}", self.inner.base_url, id);
-        let resp = self
-            .inner
-            .http
-            .put(&id_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| EdgeError::Config(format!("caddy put route: {e}")))?;
-        let status = resp.status();
+        let status = self
+            .put_with_dedup_retry(&id_url, &id, &body, "put route")
+            .await?;
         if status.is_success() {
             tracing::info!(host = %route.host, %id, "caddy add_route: PUT /id ok");
             self.inner.routes.insert(route.host.clone(), route);
             return self.verify_route_present(&id).await;
         }
-        if status.as_u16() != 404 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(EdgeError::Config(format!(
-                "caddy put route failed: status={status} body={body_text}"
-            )));
-        }
+        // Only 404 falls through to PATCH-prepend. Any other 4xx/5xx
+        // would have been turned into an Err by the helper above.
 
         // Attempt 2: route is brand new. Fetch the routes array,
         // prepend our entry, PATCH it back. We avoid POST /routes/0
@@ -418,6 +408,150 @@ impl AdminClient {
         self.inner.routes.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// Remove EVERY config tree entry whose `@id` equals `id`. Caddy's
+    /// admin API rejects PUT/PATCH that would produce duplicate `@id`
+    /// values with `indexing config: duplicate ID '<id>' found at
+    /// /config/.../X and /config/.../Y`. This typically happens when
+    /// a previous PATCH succeeded once, then was retried after a
+    /// transient error and ended up persisted twice in
+    /// `autosave.json`.
+    ///
+    /// We sweep the two arrays the share-tunnel ever writes into:
+    ///
+    ///   - `/config/apps/http/servers/<server>/routes`
+    ///   - `/config/apps/tls/automation/policies`
+    ///
+    /// For each, we GET the array, scan from tail to head (so DELETE
+    /// by index doesn't shift the survivors), and DELETE each entry
+    /// whose `@id` matches. Errors during the sweep are non-fatal
+    /// (each `ensure_*` caller follows up with the actual upsert
+    /// which will surface a real failure). Best-effort, idempotent —
+    /// safe to call repeatedly.
+    async fn dedup_id_in_arrays(&self, id: &str) {
+        // routes array (servers map auto-detect)
+        if let Ok(server_name) = self.first_server_name().await {
+            let routes_url = format!(
+                "{}/config/apps/http/servers/{}/routes",
+                self.inner.base_url, server_name
+            );
+            self.dedup_id_in_array(&routes_url, id).await;
+        }
+
+        // tls automation policies
+        let policies_url = format!(
+            "{}/config/apps/tls/automation/policies",
+            self.inner.base_url
+        );
+        self.dedup_id_in_array(&policies_url, id).await;
+    }
+
+    /// Generic helper used by `dedup_id_in_arrays`. Scans the array
+    /// at `array_url` and DELETEs every entry with matching `@id`.
+    async fn dedup_id_in_array(&self, array_url: &str, id: &str) {
+        let resp = match self.inner.http.get(array_url).send().await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if !resp.status().is_success() {
+            return;
+        }
+        let arr: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let entries = match arr.as_array() {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        // Scan tail-to-head so DELETE by index doesn't shift indices
+        // we haven't visited yet.
+        let mut deleted = 0usize;
+        for (idx, entry) in entries.iter().enumerate().rev() {
+            let entry_id = entry.get("@id").and_then(|v| v.as_str()).unwrap_or("");
+            if entry_id != id {
+                continue;
+            }
+            let abs_url = format!("{}/{}", array_url, idx);
+            match self.inner.http.delete(&abs_url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    deleted += 1;
+                    tracing::info!(%id, %abs_url, "caddy dedup: removed stale entry");
+                }
+                Ok(r) => {
+                    let s = r.status();
+                    tracing::warn!(%id, %abs_url, status = ?s, "caddy dedup: DELETE non-success");
+                }
+                Err(e) => tracing::warn!(%id, %abs_url, error = ?e, "caddy dedup: DELETE failed"),
+            }
+        }
+        if deleted > 0 {
+            tracing::info!(%id, %array_url, deleted, "caddy dedup: complete");
+        }
+    }
+
+    /// PUT a JSON body to `/id/<id>`. When the server reports a
+    /// `duplicate ID` 400 (Caddy's
+    /// `indexing config: duplicate ID 'X' found at .../A and .../B`),
+    /// run `dedup_id_in_arrays(id)` to nuke every stale copy and
+    /// retry the PUT once. This makes the `ensure_*` bootstrap
+    /// methods self-healing against an `autosave.json` that
+    /// accumulated double entries from a prior failed run.
+    ///
+    /// All other status codes propagate as `EdgeError::Config`.
+    /// Returns `Ok(())` on PUT success or 404 (caller decides
+    /// whether 404 is fatal — `add_route` follows up with a PATCH
+    /// fallback for example).
+    async fn put_with_dedup_retry(
+        &self,
+        url: &str,
+        id: &str,
+        body: &serde_json::Value,
+        op_label: &str,
+    ) -> EdgeResult<reqwest::StatusCode> {
+        let resp = self
+            .inner
+            .http
+            .put(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| EdgeError::Config(format!("caddy {op_label}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            return Ok(status);
+        }
+        let body_text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 400 && body_text.contains("duplicate ID") {
+            tracing::warn!(
+                %id,
+                op = %op_label,
+                "caddy {op_label}: duplicate ID — running dedup sweep then retrying once"
+            );
+            self.dedup_id_in_arrays(id).await;
+            // Retry the PUT once. Whatever status comes back is the
+            // final answer — no second retry to keep the loop bounded.
+            let retry = self
+                .inner
+                .http
+                .put(url)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| EdgeError::Config(format!("caddy {op_label} retry: {e}")))?;
+            let retry_status = retry.status();
+            if retry_status.is_success() || retry_status.as_u16() == 404 {
+                return Ok(retry_status);
+            }
+            let retry_body = retry.text().await.unwrap_or_default();
+            return Err(EdgeError::Config(format!(
+                "caddy {op_label} retry failed: status={retry_status} body={retry_body}"
+            )));
+        }
+        Err(EdgeError::Config(format!(
+            "caddy {op_label} failed: status={status} body={body_text}"
+        )))
+    }
+
     /// Bootstrap the `edge.<region>.<domain>` reverse-proxy route via
     /// the admin API. We can't declare this in `Caddyfile.tpl` because
     /// any Caddyfile site block with `tls { dns ... }` produces an
@@ -478,25 +612,14 @@ impl AdminClient {
         // stays at the same array slot (= tail) without churning the
         // whole config tree.
         let id_url = format!("{}/id/{}", self.inner.base_url, id);
-        let put = self
-            .inner
-            .http
-            .put(&id_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| EdgeError::Config(format!("caddy put session-ended: {e}")))?;
-        let put_status = put.status();
+        let put_status = self
+            .put_with_dedup_retry(&id_url, &id, &body, "put session-ended")
+            .await?;
         if put_status.is_success() {
             tracing::info!(%host_pattern, %id, "caddy ensure_session_ended_fallback: PUT /id ok");
             return Ok(());
         }
-        if put_status.as_u16() != 404 {
-            let body_text = put.text().await.unwrap_or_default();
-            return Err(EdgeError::Config(format!(
-                "caddy put session-ended failed: status={put_status} body={body_text}"
-            )));
-        }
+        // 404 falls through to POST-append below.
 
         // First-time install. Append to the tail of the routes array
         // (Caddy POST against the array path appends).
@@ -633,25 +756,14 @@ impl AdminClient {
 
         // Try @id PUT first — cheapest path on subsequent restarts.
         let id_url = format!("{}/id/{}", self.inner.base_url, policy_id);
-        let resp = self
-            .inner
-            .http
-            .put(&id_url)
-            .json(&policy)
-            .send()
-            .await
-            .map_err(|e| EdgeError::Config(format!("caddy put tls policy: {e}")))?;
-        let status = resp.status();
+        let status = self
+            .put_with_dedup_retry(&id_url, policy_id, &policy, "put tls policy")
+            .await?;
         if status.is_success() {
             tracing::info!(%wildcard_subject, "caddy ensure_wildcard_tls_policy: PUT /id ok");
             return Ok(());
         }
-        if status.as_u16() != 404 {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(EdgeError::Config(format!(
-                "caddy put tls policy failed: status={status} body={body}"
-            )));
-        }
+        // 404 falls through to PATCH-policies below.
 
         // 404 means the @id is unknown — we need to create the
         // policies array (or append into it). Caddy stores policies
