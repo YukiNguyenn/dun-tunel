@@ -44,6 +44,14 @@ cleanup() {
     curl -fs -X DELETE \
         -H "x-edge-api-key: ${DUN_API_KEY}" \
         "${EDGE_BASE}/v1/tunnels/${SESSION_ID}" >/dev/null 2>&1 || true
+    # SESSION_ID2 is set lazily inside step 6; check before deleting
+    # so a pre-step-6 failure doesn't reference an unbound var when
+    # `set -u` is in effect.
+    if [[ -n "${SESSION_ID2:-}" ]]; then
+        curl -fs -X DELETE \
+            -H "x-edge-api-key: ${DUN_API_KEY}" \
+            "${EDGE_BASE}/v1/tunnels/${SESSION_ID2}" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
@@ -126,6 +134,95 @@ if echo "$DOMAIN_LIST" | grep -q "\"${SUBDOMAIN}\""; then
     fail "Caddy still tracks ${SUBDOMAIN} in tls.automation.policies after delete"
 fi
 pass "Caddy route cleaned (id 404 + subdomain not in automation list)"
+
+# ── 6. SFU split-route assertions ───────────────────────────────────
+#
+# Re-provision a session so we can introspect the route JSON; without
+# this the previous DELETE has already cleaned the Caddy entry. We
+# run this AFTER step 5 instead of folding it into step 3 so the
+# two passes stay independent — a regression in either the create
+# OR the delete path produces a clear failure point.
+step "6. Caddy split-route emits /v1/sfu block"
+SESSION_ID2="smoke-sfu-$(date +%s)-$$"
+SUBDOMAIN2="${SESSION_ID2}.${REGION_ID}.${SHARE_TUNNEL_DOMAIN}"
+ROUTE_ID2="dun-tunel-$(echo "$SUBDOMAIN2" | tr '.' '_')"
+PROVISION_BODY2=$(cat <<JSON
+{
+    "sessionId": "${SESSION_ID2}",
+    "subdomain": "${SUBDOMAIN2}",
+    "tunnelTokenHash": "${TOKEN_HASH}",
+    "viewerTokenHash": "${TOKEN_HASH}",
+    "codecs": [
+        { "kind": "video", "mimeType": "video/VP8", "clockRate": 90000 },
+        { "kind": "audio", "mimeType": "audio/opus", "clockRate": 48000, "channels": 2 }
+    ],
+    "expiresAt": "$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+)
+PROVISION2=$(curl -fsS -X POST \
+    -H "Content-Type: application/json" \
+    -H "x-edge-api-key: ${DUN_API_KEY}" \
+    -d "$PROVISION_BODY2" \
+    "${EDGE_BASE}/v1/tunnels")
+echo "$PROVISION2" | grep -q '"localUpstreamPort"' || fail "second provision failed: $PROVISION2"
+
+CADDY_ROUTE2=$(curl -fsS "${CADDY_ADMIN_URL}/id/${ROUTE_ID2}" || true)
+[[ -n "$CADDY_ROUTE2" ]] || fail "Caddy missing second route ${ROUTE_ID2}"
+
+# The SFU split block matches `/v1/sfu` + `/v1/sfu/*` and reverse-
+# proxies to edge-control loopback. We assert both the path matchers
+# AND the upstream so a future config drift (different prefix or
+# missing forward_auth) fails loud here.
+echo "$CADDY_ROUTE2" | grep -q '"/v1/sfu"' \
+    || fail "Caddy route missing /v1/sfu path matcher"
+echo "$CADDY_ROUTE2" | grep -q '"/v1/sfu/\*"' \
+    || fail "Caddy route missing /v1/sfu/* wildcard matcher"
+echo "$CADDY_ROUTE2" | grep -q "127.0.0.1:${EDGE_PORT}" \
+    || fail "Caddy SFU split must reverse-proxy to edge-control loopback (127.0.0.1:${EDGE_PORT})"
+pass "Caddy split-route includes /v1/sfu/* → edge-control"
+
+# Also verify the copy_headers shim that propagates X-Forwarded-Sub
+# from the auth gate to the upstream. Without this, the SFU WS
+# handler would 401 every upgrade because it checks the header
+# against the `?session=<id>` query.
+echo "$CADDY_ROUTE2" | grep -q '"X-Forwarded-Sub"' \
+    || fail "Caddy split missing X-Forwarded-Sub copy_headers shim"
+pass "X-Forwarded-Sub copy_headers shim present"
+
+# Cleanup the SFU smoke session.
+curl -fsS -X DELETE \
+    -H "x-edge-api-key: ${DUN_API_KEY}" \
+    "${EDGE_BASE}/v1/tunnels/${SESSION_ID2}" >/dev/null
+
+# ── 7. SFU WS endpoint reachable + auth-gated ──────────────────────
+#
+# We can't open a real WS upgrade without a valid cookie — but we
+# CAN assert the route exists and rejects unauthenticated upgrades
+# the way the spec mandates. axum responds 401 (X-Forwarded-Sub
+# missing) for direct hits to edge-control, 4xx in general for
+# malformed requests. A 404 here would mean the route was never
+# registered.
+step "7. SFU WS endpoint registered + rejects missing X-Forwarded-Sub"
+WS_PROBE=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Connection: Upgrade" \
+    -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" \
+    -H "Sec-WebSocket-Key: $(printf '%016d' "$$" | base64)" \
+    "${EDGE_BASE}/v1/sfu/viewer/ws?session=does-not-matter")
+case "$WS_PROBE" in
+    401|403)
+        pass "SFU WS upgrade rejected (status=$WS_PROBE) — gate header missing as expected"
+        ;;
+    404)
+        fail "SFU WS route not registered (404); did mod.rs forget to mount /v1/sfu/viewer/ws?"
+        ;;
+    *)
+        # 200/101/426 etc. would be unexpected — log and bail so we
+        # see the actual response in the smoke output.
+        fail "SFU WS unexpected status: $WS_PROBE"
+        ;;
+esac
 
 echo
 echo "All smoke tests passed."

@@ -26,7 +26,7 @@
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
@@ -152,7 +152,18 @@ async fn check_handler(
                 sub = %claims.sub,
                 "/check 200"
             );
-            StatusCode::OK
+            // Echo the verified `sub` (= share-session id) back to
+            // Caddy so it can `copy_headers X-Forwarded-Sub` onto the
+            // upstream sub-request. The SFU WS handler in
+            // `edge-control` reads this header to authorize the
+            // `?session=<id>` query parameter — without echoing it
+            // here, every WS upgrade would 401 even though the
+            // cookie was valid.
+            let mut response_headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(&claims.sub) {
+                response_headers.insert("x-forwarded-sub", value);
+            }
+            (StatusCode::OK, response_headers).into_response()
         }
         Err(reason) => {
             // Distinguish "cookie bad" (401) from "we cannot decide
@@ -176,7 +187,7 @@ async fn check_handler(
                 status = status.as_u16(),
                 "/check rejected"
             );
-            status
+            status.into_response()
         }
     }
 }

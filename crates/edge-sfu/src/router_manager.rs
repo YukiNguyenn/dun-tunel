@@ -23,6 +23,7 @@ use crate::VIEWER_CAP_PER_SESSION;
 use anyhow::Context;
 use dashmap::DashMap;
 use edge_shared::types::SessionId;
+use mediasoup::consumer::ConsumerId;
 use mediasoup::prelude::*;
 use mediasoup::producer::ProducerId;
 use mediasoup::router::RouterId;
@@ -66,6 +67,17 @@ pub struct ConsumerTransportInfo {
     pub ice_candidates: Vec<IceCandidate>,
     pub dtls_parameters: DtlsParameters,
     pub sctp_parameters: Option<mediasoup_types::sctp_parameters::SctpParameters>,
+}
+
+/// Result of `RouterManager::consume` — the consumer parameters the
+/// viewer needs to mirror the producer on the client side.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsumedInfo {
+    pub id: ConsumerId,
+    pub producer_id: ProducerId,
+    pub kind: MediaKind,
+    pub rtp_parameters: RtpParameters,
+    pub paused: bool,
 }
 
 /// Result of `provision_session` — what edge-control returns to dun-api.
@@ -321,6 +333,165 @@ impl RouterManager {
             Some(state) => state.lock().await.viewers.len() as u32,
             None => 0,
         }
+    }
+
+    /// Snapshot of the per-session producer-id + router RTP capabilities.
+    /// The WS signaling handler needs both during the `Init` exchange so
+    /// the mediasoup-client can call `loadDevice(routerRtpCapabilities)`
+    /// and `consume(producerId)` without an extra round-trip.
+    pub async fn session_producer_info(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(ProducerId, RtpCapabilitiesFinalized)> {
+        let state = self
+            .inner
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found"))?
+            .clone();
+        let guard = state.lock().await;
+        let producer = guard
+            .plain_producer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plain producer absent"))?;
+        Ok((producer.id(), guard.router.rtp_capabilities().clone()))
+    }
+
+    /// Connect a viewer's recv-side WebRtcTransport with the DTLS
+    /// parameters from `mediasoup-client::Device.createRecvTransport`.
+    /// Idempotent at the mediasoup level: re-sending the same DTLS
+    /// fingerprints is rejected, but the WS handler is the only caller
+    /// and never repeats. Returns an error when the session or viewer
+    /// slot is unknown.
+    pub async fn connect_recv_transport(
+        &self,
+        session_id: &str,
+        viewer_id: &str,
+        dtls_parameters: DtlsParameters,
+    ) -> anyhow::Result<()> {
+        // Clone the recv transport handle out of the locked
+        // SessionState so we can `await` the connect call without
+        // holding the per-session mutex (transport.connect can take a
+        // few hundred ms during DTLS handshake).
+        let transport = {
+            let state = self
+                .inner
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?
+                .clone();
+            let guard = state.lock().await;
+            guard
+                .viewers
+                .get(viewer_id)
+                .ok_or_else(|| anyhow::anyhow!("viewer not found"))?
+                .recv_transport
+                .clone()
+        };
+        transport
+            .connect(WebRtcTransportRemoteParameters { dtls_parameters })
+            .await
+            .context("connect recv transport")?;
+        Ok(())
+    }
+
+    /// Create a Consumer on the viewer's recv transport for the given
+    /// producer + RTP capabilities. Stored in the `ViewerSlot` so its
+    /// lifetime tracks the viewer (drop = close).
+    ///
+    /// Created with `paused: true` per mediasoup-client convention —
+    /// the viewer must call `consumerResume` after the client-side
+    /// `consume()` returns. Without this the very first RTP packets
+    /// land before the receiver is ready and the decoder freezes.
+    pub async fn consume(
+        &self,
+        session_id: &str,
+        viewer_id: &str,
+        producer_id: ProducerId,
+        rtp_capabilities: RtpCapabilities,
+    ) -> anyhow::Result<ConsumedInfo> {
+        // Acquire transport handle; release the lock before the async
+        // `transport.consume` call to avoid serialising every viewer
+        // through a single mutex on a shared session.
+        let transport = {
+            let state = self
+                .inner
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?
+                .clone();
+            let guard = state.lock().await;
+            guard
+                .viewers
+                .get(viewer_id)
+                .ok_or_else(|| anyhow::anyhow!("viewer not found"))?
+                .recv_transport
+                .clone()
+        };
+
+        let mut options = ConsumerOptions::new(producer_id, rtp_capabilities);
+        options.paused = true;
+        let consumer = transport
+            .consume(options)
+            .await
+            .context("create consumer")?;
+
+        let info = ConsumedInfo {
+            id: consumer.id(),
+            producer_id: consumer.producer_id(),
+            kind: consumer.kind(),
+            rtp_parameters: consumer.rtp_parameters().clone(),
+            paused: true,
+        };
+
+        // Re-acquire lock to store the consumer in the viewer slot.
+        // We re-fetch the entry rather than caching the Arc because
+        // `remove_viewer` may have run while we were awaiting and
+        // dropping the consumer here would silently leak the
+        // mediasoup resources (until the router itself closes).
+        let state = self
+            .inner
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found"))?
+            .clone();
+        let mut guard = state.lock().await;
+        let slot = guard
+            .viewers
+            .get_mut(viewer_id)
+            .ok_or_else(|| anyhow::anyhow!("viewer disappeared during consume"))?;
+        slot.consumers.push(consumer);
+        Ok(info)
+    }
+
+    /// Resume the named consumer so RTP starts flowing. Mirrors
+    /// mediasoup-client `consumer.resume()`.
+    pub async fn resume_consumer(
+        &self,
+        session_id: &str,
+        viewer_id: &str,
+        consumer_id: ConsumerId,
+    ) -> anyhow::Result<()> {
+        let consumer = {
+            let state = self
+                .inner
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?
+                .clone();
+            let guard = state.lock().await;
+            let slot = guard
+                .viewers
+                .get(viewer_id)
+                .ok_or_else(|| anyhow::anyhow!("viewer not found"))?;
+            slot.consumers
+                .iter()
+                .find(|c| c.id() == consumer_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("consumer not found"))?
+        };
+        consumer.resume().await.context("resume consumer")?;
+        Ok(())
     }
 
     fn pick_worker(&self) -> &Worker {

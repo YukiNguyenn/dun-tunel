@@ -68,10 +68,22 @@ impl AppState {
         } else if let Some(ref gate) = auth_gate_upstream {
             tracing::info!(%gate, "viewer cookie auth gate enabled (forward_auth → edge-viewer-gate)");
         }
+        // edge-control loopback for the SFU signalling split-route.
+        // edge-control binds `0.0.0.0:<bind_port>` (typically 9443),
+        // and Caddy in `network_mode: host` reaches it via loopback.
+        // The split forwards `/v1/sfu/*` to this upstream so the
+        // viewer mediasoup-client opens its WS on the same origin
+        // as the share page (R9.4 cookie domain pinning).
+        let edge_control_upstream = Some(format!("127.0.0.1:{}", cfg.bind_port));
+        tracing::info!(
+            upstream = %edge_control_upstream.as_deref().unwrap_or("(disabled)"),
+            "SFU signalling split-route enabled (/v1/sfu/* → edge-control loopback)"
+        );
         let caddy = AdminClient::with_upstreams(
             cfg.caddy_admin_url.clone(),
             dun_api_upstream,
             auth_gate_upstream,
+            edge_control_upstream,
         );
 
         // Bootstrap the wildcard TLS policy when both domain + CF

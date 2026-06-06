@@ -7,7 +7,8 @@ use axum::{
     Json,
 };
 use edge_shared::types::{
-    CaddyRoute, CreateSessionReq, CreateSessionResp, RatholeService, SessionId,
+    CaddyRoute, CreateSessionReq, CreateSessionResp, RatholeService, RatholeTransport,
+    SessionId,
 };
 use std::sync::Arc;
 
@@ -43,6 +44,7 @@ pub async fn create(
             name: req.session_id.clone(),
             token_hash: req.tunnel_token.clone(),
             bind_addr: format!("0.0.0.0:{local_port}"),
+            transport: None, // default TCP — HTTP/WS upstream from rathole client
         })
         .await
         .map_err(|e| {
@@ -77,6 +79,40 @@ pub async fn create(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+
+    // 4b. Register UDP rathole service for the session's RTP stream.
+    //
+    // Architecture (Phase 2 task 10.B.1): Neko inside the owner's
+    // dun-browser container runs a GStreamer pipeline whose `udpsink`
+    // writes VP8 RTP packets to `127.0.0.1:5004`. The owner's rathole
+    // client tunnels that UDP stream to `0.0.0.0:<plain_rtp_port>` on
+    // this Edge_Server, where mediasoup's comedia-mode PlainTransport
+    // is already listening (created by `provision_session` in step 4).
+    //
+    // Failure here tears down everything from steps 2-4 so we never
+    // half-bind a session.
+    //
+    // Naming convention: `<session_id>-rtp` keeps the UDP service
+    // siblings with the TCP service in the rathole TOML and guarantees
+    // both share the same lifecycle in the registry.
+    let rtp_service_name = format!("{}-rtp", req.session_id);
+    if let Err(e) = state
+        .rathole
+        .register(RatholeService {
+            name: rtp_service_name.clone(),
+            token_hash: req.tunnel_token.clone(),
+            bind_addr: format!("0.0.0.0:{}", provisioned.plain_rtp_port),
+            transport: Some(RatholeTransport::Udp),
+        })
+        .await
+    {
+        tracing::error!(error = ?e, %req.session_id, "rathole UDP RTP register failed");
+        let _ = state.caddy.remove_route(&req.subdomain).await;
+        let _ = state.rathole.deregister(&req.session_id).await;
+        let _ = state.sfu.close_session(&req.session_id).await;
+        state.port_allocator.release(local_port).await;
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // 5. Persist session_id → subdomain mapping so the deprovision
     //    handler can recover the Caddy route host. Without this the
@@ -152,9 +188,11 @@ pub async fn deprovision(
     };
 
     // Best-effort cleanup all components in parallel
-    let (caddy_res, rathole_res, _) = tokio::join!(
+    let rtp_service_name = format!("{}-rtp", session_id);
+    let (caddy_res, rathole_res, rathole_rtp_res, _) = tokio::join!(
         caddy_fut,
         state.rathole.deregister(&session_id),
+        state.rathole.deregister(&rtp_service_name),
         state.sfu.close_session(&session_id),
     );
     if let Err(e) = caddy_res {
@@ -162,6 +200,9 @@ pub async fn deprovision(
     }
     if let Err(e) = rathole_res {
         tracing::warn!(error = ?e, %session_id, "rathole deregister failed");
+    }
+    if let Err(e) = rathole_rtp_res {
+        tracing::warn!(error = ?e, %session_id, "rathole RTP deregister failed");
     }
     StatusCode::NO_CONTENT
 }

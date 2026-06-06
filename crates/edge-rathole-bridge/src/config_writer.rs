@@ -20,7 +20,7 @@
 //! (Windows; rathole on Windows uses control socket for hot reload).
 
 use edge_shared::errors::{EdgeError, EdgeResult};
-use edge_shared::types::RatholeService;
+use edge_shared::types::{RatholeService, RatholeTransport};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,6 +41,11 @@ pub struct ServerConfig<'a> {
 pub struct ServiceEntry<'a> {
     pub token: &'a str,
     pub bind_addr: &'a str,
+    /// Skipped when `None` (TCP default) so existing service blocks
+    /// stay byte-identical and don't trigger reload no-ops on upgrade.
+    /// `Some("udp")` adds `type = "udp"` for the SFU media tunnel.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<&'a str>,
 }
 
 /// Render `RatholeService` list into a TOML string with stable ordering.
@@ -51,11 +56,18 @@ pub fn render_toml(server_bind: &str, services: &[RatholeService]) -> EdgeResult
     let map: BTreeMap<&str, ServiceEntry> = services
         .iter()
         .map(|s| {
+            let service_type = match s.transport {
+                // Default TCP — emit nothing so Phase 1 deployments
+                // produce identical TOML to before.
+                None | Some(RatholeTransport::Tcp) => None,
+                Some(RatholeTransport::Udp) => Some("udp"),
+            };
             (
                 s.name.as_str(),
                 ServiceEntry {
                     token: s.token_hash.as_str(),
                     bind_addr: s.bind_addr.as_str(),
+                    service_type,
                 },
             )
         })
@@ -119,11 +131,13 @@ mod tests {
                 name: "zzz".into(),
                 token_hash: "tokz".into(),
                 bind_addr: "0.0.0.0:11001".into(),
+                transport: None,
             },
             RatholeService {
                 name: "aaa".into(),
                 token_hash: "toka".into(),
                 bind_addr: "0.0.0.0:11002".into(),
+                transport: None,
             },
         ];
         let out1 = render_toml("0.0.0.0:2333", &svcs).unwrap();
@@ -133,6 +147,35 @@ mod tests {
         let aaa_pos = out1.find("services.aaa").unwrap();
         let zzz_pos = out1.find("services.zzz").unwrap();
         assert!(aaa_pos < zzz_pos);
+    }
+
+    #[test]
+    fn render_toml_tcp_default_omits_type_field() {
+        // Backward-compat: every existing Phase 1 deployment must
+        // continue producing identical TOML to before — type field
+        // is suppressed when transport is Tcp/None so reload doesn't
+        // think the file changed across an in-place upgrade.
+        let svcs = vec![RatholeService {
+            name: "abc".into(),
+            token_hash: "tok".into(),
+            bind_addr: "0.0.0.0:11042".into(),
+            transport: Some(RatholeTransport::Tcp),
+        }];
+        let out = render_toml("0.0.0.0:2333", &svcs).unwrap();
+        assert!(!out.contains("type"), "TCP default must not emit `type` field; got:\n{out}");
+        assert!(out.contains("services.abc"));
+    }
+
+    #[test]
+    fn render_toml_udp_emits_type_field() {
+        let svcs = vec![RatholeService {
+            name: "session-rtp".into(),
+            token_hash: "tok".into(),
+            bind_addr: "0.0.0.0:50042".into(),
+            transport: Some(RatholeTransport::Udp),
+        }];
+        let out = render_toml("0.0.0.0:2333", &svcs).unwrap();
+        assert!(out.contains("type = \"udp\""), "UDP services must emit `type = \"udp\"`; got:\n{out}");
     }
 
     #[tokio::test]

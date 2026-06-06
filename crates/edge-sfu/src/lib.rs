@@ -11,7 +11,8 @@ pub mod transport;
 pub mod viewer_cap;
 
 pub use router_manager::{
-    ConsumerTransportInfo, ProvisionedRouter, RouterManager, SessionState, ViewerSlot,
+    ConsumedInfo, ConsumerTransportInfo, ProvisionedRouter, RouterManager, SessionState,
+    ViewerSlot,
 };
 pub use transport::RouterListenInfo;
 

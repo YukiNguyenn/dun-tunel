@@ -91,41 +91,64 @@ pub struct MediaCodec {
 
 /// Outbound callback events từ edge → dun-api.
 /// Endpoint: `POST /tunnels/edge-callback` trên dun-api side.
+///
+/// Wire format mirrors dun-api `edgeCallbackBody` typebox:
+///   - Top-level discriminator field is `event` (literal: snake_case
+///     name like `viewer_connected`, `bandwidth_delta`).
+///   - All other fields use camelCase (per variant).
+///
+/// We achieve that with `tag = "event"` + `rename_all = "snake_case"`
+/// at the enum level (handles the discriminator value) and a
+/// per-variant `rename_all = "camelCase"` (handles the field names).
+/// The callback is sent as a SINGLE flat event per HTTP request —
+/// dun-api's typebox schema does not accept batched events. Bandwidth
+/// delta has its own monotonic sequence so retries dedupe safely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "event", rename_all = "snake_case")]
 pub enum EdgeCallbackEvent {
+    #[serde(rename_all = "camelCase")]
     TunnelConnected {
         session_id: SessionId,
-        ts: DateTime<Utc>,
+        region: RegionId,
+        sfu_router_id: String,
     },
+    #[serde(rename_all = "camelCase")]
+    TunnelDisconnected {
+        session_id: SessionId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
     ViewerConnected {
         session_id: SessionId,
-        ts: DateTime<Utc>,
-        ip: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_fingerprint: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ip: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         user_agent: Option<String>,
-        token_fingerprint: String,
     },
+    #[serde(rename_all = "camelCase")]
     ViewerDisconnected {
         session_id: SessionId,
-        ts: DateTime<Utc>,
-        token_fingerprint: String,
-    },
-    ViewerCapReached {
-        session_id: SessionId,
-        ts: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_fingerprint: Option<String>,
     },
     /// R3.5 — sequence-based idempotent delivery
+    #[serde(rename_all = "camelCase")]
     BandwidthDelta {
         session_id: SessionId,
         delta_mb: f64,
-        interval_start: DateTime<Utc>,
-        interval_end: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interval_start: Option<DateTime<Utc>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interval_end: Option<DateTime<Utc>>,
         sequence: u64,
     },
     /// R18.2 — region health metrics every 30s
+    #[serde(rename_all = "camelCase")]
     RegionMetrics {
         region: RegionId,
-        ts: DateTime<Utc>,
         cpu_pct: f32,
         active_sessions: u32,
         bandwidth_utilization_pct: f32,
@@ -147,6 +170,25 @@ pub struct CaddyRoute {
     pub ws_paths: Vec<String>,
 }
 
+/// Rathole service transport. Defaults to TCP for backward compatibility
+/// — every existing service in production runs HTTP/WebSocket and is TCP.
+/// UDP is added for share-tunnel SFU integration (Phase 2 task 10.B.1):
+/// each session that opts into mediasoup gets a second service block
+/// `[<id>-rtp]` with `type = "udp"` so Neko's GStreamer udpsink RTP
+/// stream tunnels from the owner container straight to the edge
+/// mediasoup `PlainTransport`.
+///
+/// Wire format is the lowercase string Rathole expects in its TOML
+/// (`"tcp"` / `"udp"`) — keeps the server config writer free of any
+/// extra mapping layer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RatholeTransport {
+    #[default]
+    Tcp,
+    Udp,
+}
+
 /// Rathole service entry for `edge-rathole-bridge`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +196,12 @@ pub struct RatholeService {
     pub name: String, // session_id
     pub token_hash: String,
     pub bind_addr: String, // "0.0.0.0:11042"
+    /// Service transport. Defaults to TCP. UDP is used for the per-session
+    /// `<id>-rtp` block tunneling Neko GStreamer RTP into mediasoup.
+    /// Field is `Option<_>` so older wire payloads without this key
+    /// (Phase 1 deployments) still deserialise as TCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<RatholeTransport>,
 }
 
 /// Health check response cho `GET /healthz`.
@@ -163,4 +211,69 @@ pub struct HealthResponse {
     pub region: RegionId,
     pub uptime_secs: u64,
     pub active_sessions: u32,
+}
+
+#[cfg(test)]
+mod callback_event_tests {
+    //! Wire-format guard for `EdgeCallbackEvent`.
+    //!
+    //! dun-api's `edgeCallbackBody` typebox schema accepts a flat
+    //! single event with discriminator `event` and camelCase fields.
+    //! These tests pin every variant's serialised shape so a
+    //! refactor on either side fails loud here instead of silently
+    //! breaking host-mode viewer count or bandwidth dedup.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn viewer_connected_camel_case_and_event_tag() {
+        let ev = EdgeCallbackEvent::ViewerConnected {
+            session_id: "sess-1".into(),
+            viewer_fingerprint: Some("v-abc".into()),
+            ip: Some("198.51.100.42".into()),
+            user_agent: Some("Mozilla/5.0".into()),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "event": "viewer_connected",
+                "sessionId": "sess-1",
+                "viewerFingerprint": "v-abc",
+                "ip": "198.51.100.42",
+                "userAgent": "Mozilla/5.0",
+            })
+        );
+    }
+
+    #[test]
+    fn viewer_disconnected_skips_none_fingerprint() {
+        let ev = EdgeCallbackEvent::ViewerDisconnected {
+            session_id: "sess-1".into(),
+            viewer_fingerprint: None,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v, json!({ "event": "viewer_disconnected", "sessionId": "sess-1" }));
+    }
+
+    #[test]
+    fn bandwidth_delta_keeps_sequence_and_camel_case_intervals() {
+        let ev = EdgeCallbackEvent::BandwidthDelta {
+            session_id: "sess-1".into(),
+            delta_mb: 1.25,
+            interval_start: None,
+            interval_end: None,
+            sequence: 7,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "event": "bandwidth_delta",
+                "sessionId": "sess-1",
+                "deltaMb": 1.25,
+                "sequence": 7,
+            })
+        );
+    }
 }

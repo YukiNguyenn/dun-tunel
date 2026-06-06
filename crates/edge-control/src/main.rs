@@ -3,6 +3,7 @@
 //! Phase 1 minimal: bind axum HTTP on :8443 with stub routes.
 //! mTLS + real handlers come in subsequent phases (see spec design 15.7).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -31,6 +32,16 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = ?listener.local_addr()?, "edge-control listening");
 
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info` is required for the SFU
+    // WS handler's `ConnectInfo<SocketAddr>` extractor — without it
+    // axum panics at upgrade time. The plain `app` service was fine
+    // for the HTTP-only routes; the WS is the new caller. Cost is
+    // zero: the connect-info wrapper just stashes the peer addr in
+    // the request extensions on every accept.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

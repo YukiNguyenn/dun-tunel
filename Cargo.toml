@@ -13,7 +13,7 @@ authors = ["Dun Studio"]
 tokio = { version = "1.40", features = ["full"] }
 
 # http server / client
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit"] }

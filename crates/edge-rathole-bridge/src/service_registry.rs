@@ -159,6 +159,7 @@ mod tests {
             name: "sess1".into(),
             token_hash: "hash1".into(),
             bind_addr: "0.0.0.0:11001".into(),
+            transport: None,
         })
         .await
         .unwrap();
@@ -183,6 +184,7 @@ mod tests {
             name: "sess1".into(),
             token_hash: "hash1".into(),
             bind_addr: "0.0.0.0:11001".into(),
+            transport: None,
         })
         .await
         .unwrap();

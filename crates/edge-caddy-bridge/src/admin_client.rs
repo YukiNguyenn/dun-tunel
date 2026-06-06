@@ -37,13 +37,19 @@ struct AdminClientInner {
     /// check is skipped (legacy / dev shape — viewer subdomains are
     /// open to anyone with the URL).
     auth_gate_upstream: Option<String>,
+    /// Optional `host:port` of the local `edge-control` HTTP server
+    /// (typically `127.0.0.1:9443`). When `Some`, viewer subdomains
+    /// split-route `/v1/sfu/*` to edge-control (still gated by
+    /// `auth_gate_upstream`) so the viewer mediasoup-client can open
+    /// `/v1/sfu/viewer/ws` against the same origin as the page.
+    edge_control_upstream: Option<String>,
     routes: DashMap<String, CaddyRoute>,
     http: reqwest::Client,
 }
 
 impl AdminClient {
     pub fn new(base_url: String) -> Self {
-        Self::with_upstreams(base_url, None, None)
+        Self::with_upstreams(base_url, None, None, None)
     }
 
     /// Build an `AdminClient` that knows where to find dun-api so it
@@ -51,19 +57,21 @@ impl AdminClient {
     /// Auth gate is left disabled — use [`with_upstreams`] to enable
     /// the cookie auth sidecar.
     pub fn with_dun_api(base_url: String, dun_api_upstream: Option<String>) -> Self {
-        Self::with_upstreams(base_url, dun_api_upstream, None)
+        Self::with_upstreams(base_url, dun_api_upstream, None, None)
     }
 
     /// Build an `AdminClient` that knows where to find both dun-api
     /// (for cookie-bearing viewer endpoints) and the
     /// `edge-viewer-gate` sidecar (for stateless cookie auth on every
-    /// non-public viewer-subdomain request). This is the shape we
-    /// use in production; tests / dev fall back to the older
-    /// constructors.
+    /// non-public viewer-subdomain request) plus optional
+    /// `edge_control_upstream` (for SFU signalling). This is the
+    /// shape we use in production; tests / dev fall back to the
+    /// older constructors.
     pub fn with_upstreams(
         base_url: String,
         dun_api_upstream: Option<String>,
         auth_gate_upstream: Option<String>,
+        edge_control_upstream: Option<String>,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -74,6 +82,7 @@ impl AdminClient {
                 base_url,
                 dun_api_upstream,
                 auth_gate_upstream,
+                edge_control_upstream,
                 routes: DashMap::new(),
                 http,
             }),
@@ -112,6 +121,7 @@ impl AdminClient {
             &route,
             self.inner.dun_api_upstream.as_deref(),
             self.inner.auth_gate_upstream.as_deref(),
+            self.inner.edge_control_upstream.as_deref(),
         );
 
         // Attempt 1: PUT /id/<route_id> for in-place update.

@@ -36,6 +36,21 @@ const DUN_API_PATH_PREFIXES: &[&str] = &[
     "/viewer/jwks",
 ];
 
+/// Path prefixes routed to the local `edge-control` loopback (the
+/// SFU signalling crate that owns mediasoup `Router` + `Consumer`
+/// per-session). Used by the viewer mediasoup-client to negotiate
+/// the WebRTC handshake against the edge SFU instead of the legacy
+/// neko WS inside the rathole tunnel.
+///
+/// Why is this a separate split block (and not just another auth-
+/// gated tunnel rewrite)? edge-control lives on the host loopback
+/// at `127.0.0.1:9443`, NOT inside the per-session container — so
+/// the rathole tunnel upstream cannot serve it. The auth gate still
+/// runs in front (forward_auth → 2xx) so only verified cookies can
+/// open the SFU WS, with `X-Forwarded-Sub` carrying the share-
+/// session id for the handler's `?session=<id>` query check.
+const EDGE_CONTROL_PATH_PREFIXES: &[&str] = &["/v1/sfu"];
+
 /// Path patterns that MUST be hard-blocked at the edge, regardless of
 /// auth gate decisions, when accessed via a public viewer subdomain.
 ///
@@ -211,10 +226,20 @@ pub fn route_id(host: &str) -> String {
 /// `forward_auth`'d to `<auth_gate_upstream>/check`; only 2xx
 /// responses pass through to the rathole tunnel. When `None` the
 /// auth check is skipped (legacy behaviour for tests / dev).
+///
+/// `edge_control_upstream` is the loopback `host:port` of edge-
+/// control itself (typically `127.0.0.1:9443`). When `Some`, the
+/// `/v1/sfu/*` paths split-route to edge-control (still gated by
+/// `auth_gate_upstream` when set) so the viewer mediasoup-client can
+/// open `/v1/sfu/viewer/ws` against the same origin as the share
+/// page. When `None`, those paths fall through to the tunnel — which
+/// will 404 because the container has no SFU handler. Provided as
+/// `None` only by tests that exercise the legacy behaviour.
 pub fn build_route(
     route: &CaddyRoute,
     dun_api_upstream: Option<&str>,
     auth_gate_upstream: Option<&str>,
+    edge_control_upstream: Option<&str>,
 ) -> Value {
     let tunnel_handle = json!({
         "handler": "reverse_proxy",
@@ -353,10 +378,12 @@ pub fn build_route(
 
     if let Some(gate) = auth_gate_upstream {
         // forward_auth pattern: reverse_proxy to `<gate>/check`. On
-        // 2xx the `handle_response` continues with the tunnel; on
-        // 4xx/5xx Caddy returns the gate's response directly so the
-        // viewer-ui receives a clean 401 (its `sessionEndedGuard`
-        // then reloads to trigger the exchange flow).
+        // 2xx the `handle_response` continues with the upstream
+        // (edge-control for `/v1/sfu/*`, tunnel for everything
+        // else); on 4xx/5xx Caddy returns the gate's response
+        // directly so the viewer-ui receives a clean 401 (its
+        // `sessionEndedGuard` then reloads to trigger the exchange
+        // flow).
         //
         // We strip `Content-Length` / body from the sub-request: the
         // gate only inspects headers (Cookie + X-Forwarded-Host) and
@@ -368,6 +395,100 @@ pub fn build_route(
         // 503 responses also carry CSP / nosniff / frame-ancestors.
         // Without this a gate-generated error page would still be
         // sniffable / iframable, defeating the whole hardening pass.
+        //
+        // The `copy_headers` shim (a `headers` handler prepended
+        // inside the 2xx routes list) propagates the gate's
+        // `X-Forwarded-Sub` response header onto the upstream
+        // request. The SFU WS handler reads this to authorize the
+        // `?session=<id>` query parameter against the verified
+        // share-session id from the cookie. Without this shim,
+        // every WS upgrade would 401.
+
+        // SFU-only forward_auth → edge-control. Emitted before the
+        // generic tunnel block so the more specific path matcher
+        // wins. Same gate sub-request as the tunnel block — Caddy
+        // dedup is at the cache layer, not per-route, so the call
+        // hits the gate twice for any viewer that opens both the
+        // page and the SFU WS. The gate is in-process EdDSA verify
+        // (~200µs) so the duplicate is acceptable.
+        if let Some(edge_upstream) = edge_control_upstream {
+            let edge_handle = json!({
+                "handler": "reverse_proxy",
+                "transport": {
+                    "protocol": "http",
+                    "versions": ["1.1", "2"],
+                },
+                "upstreams": [{"dial": edge_upstream.to_string()}],
+                // X-Forwarded-Host is set by the auth-gate sub-
+                // request, but the upstream request needs it set
+                // explicitly here so the SFU handler can validate
+                // the host claim against the request host. Same
+                // shape as the tunnel handle.
+                "headers": {
+                    "request": {
+                        "set": {
+                            "Host": [route.host.clone()],
+                            "X-Forwarded-Host": ["{http.request.host}"],
+                            "X-Forwarded-Proto": ["{http.request.scheme}"],
+                            "X-Forwarded-For": ["{http.request.remote.host}"],
+                        }
+                    },
+                    "response": viewer_response_security_headers(),
+                },
+            });
+            let sfu_auth_handle = json!({
+                "match": [{
+                    "path": EDGE_CONTROL_PATH_PREFIXES.iter()
+                        .flat_map(|p| [p.to_string(), format!("{p}/*")])
+                        .collect::<Vec<_>>(),
+                }],
+                "handle": [{
+                    "handler": "reverse_proxy",
+                    "rewrite": {
+                        "method": "GET",
+                        "uri": "/check"
+                    },
+                    "upstreams": [{"dial": gate.to_string()}],
+                    "headers": {
+                        "request": {
+                            "set": {
+                                "X-Forwarded-Host": ["{http.request.host}"],
+                                "X-Forwarded-Method": ["{http.request.method}"],
+                                "X-Forwarded-Uri": ["{http.request.uri}"]
+                            }
+                        },
+                        "response": viewer_response_security_headers(),
+                    },
+                    "handle_response": [
+                        {
+                            "match": {"status_code": [2]},
+                            "routes": [
+                                // copy_headers shim — propagate the
+                                // verified `sub` claim onto the
+                                // upstream request before forwarding.
+                                {
+                                    "handle": [{
+                                        "handler": "headers",
+                                        "request": {
+                                            "set": {
+                                                "X-Forwarded-Sub": [
+                                                    "{http.reverse_proxy.header.X-Forwarded-Sub}"
+                                                ]
+                                            }
+                                        }
+                                    }]
+                                },
+                                {
+                                    "handle": [edge_handle]
+                                }
+                            ]
+                        }
+                    ]
+                }],
+            });
+            inner_routes.push(sfu_auth_handle);
+        }
+
         let auth_handle = json!({
             "handle": [{
                 "handler": "reverse_proxy",
@@ -389,9 +510,23 @@ pub fn build_route(
                 "handle_response": [
                     {
                         "match": {"status_code": [2]},
-                        "routes": [{
-                            "handle": [tunnel_handle.clone()]
-                        }]
+                        "routes": [
+                            {
+                                "handle": [{
+                                    "handler": "headers",
+                                    "request": {
+                                        "set": {
+                                            "X-Forwarded-Sub": [
+                                                "{http.reverse_proxy.header.X-Forwarded-Sub}"
+                                            ]
+                                        }
+                                    }
+                                }]
+                            },
+                            {
+                                "handle": [tunnel_handle.clone()]
+                            }
+                        ]
                     }
                 ]
             }],
@@ -514,7 +649,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec!["/api/ws".into()],
         };
-        let v = build_route(&r, None, None);
+        let v = build_route(&r, None, None, None);
         assert_eq!(v["@id"], "dun-tunel-abc_sin_dun-studio_xyz");
         assert_eq!(v["match"][0]["host"][0], "abc.sin.dun-studio.xyz");
     }
@@ -526,7 +661,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), None);
+        let v = build_route(&r, Some("127.0.0.1:3010"), None, None);
         let inner = &v["handle"][0]["routes"];
         // Index 0 is now the hard-block /host entry; api split is at
         // index 1.
@@ -563,7 +698,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, None, None);
+        let v = build_route(&r, None, None, None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // Hard-block /host (idx 0) + tunnel default (idx 1) = 2 entries.
         assert_eq!(inner.len(), 2);
@@ -580,10 +715,10 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"));
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // 0: hard-block /host, 1: dun-api split, 2: public assets,
-        // 3: auth-gated tunnel.
+        // 3: auth-gated tunnel. (No SFU block when edge_control is None.)
         assert_eq!(inner.len(), 4);
 
         // public asset bypass
@@ -601,12 +736,62 @@ mod tests {
         assert_eq!(auth_handle["handler"], "reverse_proxy");
         assert_eq!(auth_handle["upstreams"][0]["dial"], "127.0.0.1:9444");
         assert_eq!(auth_handle["rewrite"]["uri"], "/check");
-        // 2xx response → forward to tunnel
+        // 2xx response → copy_headers shim then forward to tunnel
         let handle_response = auth_handle["handle_response"].as_array().unwrap();
         assert_eq!(handle_response[0]["match"]["status_code"][0], 2);
+        let routes = handle_response[0]["routes"].as_array().unwrap();
+        // [0] copy_headers shim, [1] tunnel reverse_proxy.
+        assert_eq!(routes[0]["handle"][0]["handler"], "headers");
+        assert!(
+            routes[0]["handle"][0]["request"]["set"]["X-Forwarded-Sub"]
+                .is_array(),
+            "copy_headers shim must propagate X-Forwarded-Sub"
+        );
         assert_eq!(
-            handle_response[0]["routes"][0]["handle"][0]["upstreams"][0]["dial"],
+            routes[1]["handle"][0]["upstreams"][0]["dial"],
             "127.0.0.1:11042"
+        );
+    }
+
+    #[test]
+    fn build_route_with_edge_control_inserts_sfu_split() {
+        let r = CaddyRoute {
+            host: "abc.sin.dun-studio.xyz".into(),
+            upstream: "127.0.0.1:11042".into(),
+            ws_paths: vec![],
+        };
+        let v = build_route(
+            &r,
+            Some("127.0.0.1:3010"),
+            Some("127.0.0.1:9444"),
+            Some("127.0.0.1:9443"),
+        );
+        let inner = v["handle"][0]["routes"].as_array().unwrap();
+        // 0: hard-block, 1: dun-api split, 2: public assets,
+        // 3: SFU forward_auth → edge-control, 4: generic auth tunnel.
+        assert_eq!(inner.len(), 5);
+
+        let sfu_handle = &inner[3];
+        let sfu_paths = sfu_handle["match"][0]["path"].as_array().unwrap();
+        let sfu_paths_str: Vec<String> = sfu_paths
+            .iter()
+            .map(|p| p.as_str().unwrap().to_string())
+            .collect();
+        assert!(sfu_paths_str.iter().any(|p| p == "/v1/sfu"));
+        assert!(sfu_paths_str.iter().any(|p| p == "/v1/sfu/*"));
+
+        // Forward_auth → gate, 2xx → edge-control upstream (after
+        // the X-Forwarded-Sub copy_headers shim).
+        let sfu_proxy = &sfu_handle["handle"][0];
+        assert_eq!(sfu_proxy["handler"], "reverse_proxy");
+        assert_eq!(sfu_proxy["upstreams"][0]["dial"], "127.0.0.1:9444");
+        let routes_2xx = sfu_proxy["handle_response"][0]["routes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(routes_2xx[0]["handle"][0]["handler"], "headers");
+        assert_eq!(
+            routes_2xx[1]["handle"][0]["upstreams"][0]["dial"],
+            "127.0.0.1:9443"
         );
     }
 
@@ -655,7 +840,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, None, None);
+        let v = build_route(&r, None, None, None);
         let inner = &v["handle"][0]["routes"];
         // [0] hard-block /host, [1] tunnel default. Security headers
         // are on the tunnel handler.
@@ -690,7 +875,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"));
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // Inner route order with full wiring (api + assets + auth):
         //   [0] hard-block /host (defense in depth)
@@ -716,7 +901,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"));
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // Hard-block must be first so Caddy returns 403 before any
         // auth gate / dun-api / tunnel handler runs.

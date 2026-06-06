@@ -125,8 +125,8 @@ impl ReporterRunner {
         let event = EdgeCallbackEvent::BandwidthDelta {
             session_id: session_id.to_string(),
             delta_mb,
-            interval_start: entry.last_reported_at,
-            interval_end: now,
+            interval_start: Some(entry.last_reported_at),
+            interval_end: Some(now),
             sequence: entry.next_sequence,
         };
         self.callback.send(event).await?;
