@@ -756,6 +756,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dashmap",
+ "edge-callback-client",
  "edge-shared",
  "mediasoup",
  "mediasoup-types",

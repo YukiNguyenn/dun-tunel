@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 edge-shared = { path = "../edge-shared" }
+# Snapshot reporter posts `EdgeCallbackEvent::SessionSnapshot` every
+# 30s for self-healing viewer count drift. Pulled in here (rather
+# than wiring through a callback closure from edge-control) so the
+# reporter task has a clean ownership model — it owns its own
+# `Client` clone and runs for the process lifetime.
+edge-callback-client = { path = "../edge-callback-client" }
 # mediasoup needs Python + Meson + C++ toolchain to build native bindings.
 # On Windows dev, build via WSL2 or skip with: cargo check --workspace --exclude edge-sfu
 # CI builds on Linux where toolchain is available.
