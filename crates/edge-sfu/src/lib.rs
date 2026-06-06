@@ -6,6 +6,7 @@
 //! See spec R8 + R23.2.
 
 pub mod router_manager;
+pub mod snapshot_reporter;
 pub mod stats;
 pub mod transport;
 pub mod viewer_cap;
@@ -14,6 +15,7 @@ pub use router_manager::{
     ConsumedInfo, ConsumerTransportInfo, ProvisionedRouter, RouterManager, SessionState,
     ViewerSlot,
 };
+pub use snapshot_reporter::SessionSnapshotReporter;
 pub use transport::RouterListenInfo;
 
 /// Re-export of mediasoup types needed by callers (edge-control's

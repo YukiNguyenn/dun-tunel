@@ -145,6 +145,15 @@ pub enum EdgeCallbackEvent {
         interval_end: Option<DateTime<Utc>>,
         sequence: u64,
     },
+    /// 30s authoritative count from `SessionState.viewers.len()`.
+    /// Self-healing: dun-api OVERWRITES `viewerCount` rather than
+    /// $inc — any drift from dropped per-event callbacks collapses
+    /// back in ≤ 30s.
+    #[serde(rename_all = "camelCase")]
+    SessionSnapshot {
+        session_id: SessionId,
+        active_connections: u32,
+    },
     /// R18.2 — region health metrics every 30s
     #[serde(rename_all = "camelCase")]
     RegionMetrics {
@@ -273,6 +282,23 @@ mod callback_event_tests {
                 "sessionId": "sess-1",
                 "deltaMb": 1.25,
                 "sequence": 7,
+            })
+        );
+    }
+
+    #[test]
+    fn session_snapshot_serialises_flat_event_with_camel_case_count() {
+        let ev = EdgeCallbackEvent::SessionSnapshot {
+            session_id: "sess-1".into(),
+            active_connections: 5,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "event": "session_snapshot",
+                "sessionId": "sess-1",
+                "activeConnections": 5,
             })
         );
     }

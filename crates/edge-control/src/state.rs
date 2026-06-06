@@ -13,7 +13,7 @@ use edge_bandwidth::BandwidthReporter;
 use edge_caddy_bridge::AdminClient;
 use edge_callback_client::Client as CallbackClient;
 use edge_rathole_bridge::{PortAllocator, ServiceRegistry};
-use edge_sfu::RouterManager;
+use edge_sfu::{RouterManager, SessionSnapshotReporter};
 use edge_shared::jwt::JwtVerifier;
 use edge_shared::types::SessionId;
 use edge_shared::HttpRevocationOracle;
@@ -165,6 +165,16 @@ impl AppState {
             callback.clone(),
             cfg.region.clone(),
             SequenceStore::new(cfg.persistent_queue_dir.clone()),
+        );
+
+        // Authoritative session snapshot every 30s. Self-healing for
+        // viewer count drift — see `SessionSnapshotReporter` doc
+        // comment. We don't keep the handle in `AppState` because
+        // the loop runs unconditionally for the process lifetime;
+        // there's nothing to call from the routes.
+        let _snapshot = SessionSnapshotReporter::start(
+            sfu.clone_handle(),
+            callback.clone(),
         );
 
         // Subdomain store: rebuild session_id → subdomain map at boot.
