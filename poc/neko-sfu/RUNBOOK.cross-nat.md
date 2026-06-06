@@ -44,6 +44,14 @@ sudo ufw status numbered
 > Nếu provider có firewall ngoài UFW (DigitalOcean cloud firewall,
 > Hetzner cloud, AWS SG…), cũng phải mở những port này tương đương.
 
+> **Lưu ý về `network_mode: host`**: SFU container chạy host
+> network nên bind thẳng lên 4443/tcp và toàn bộ dải UDP 50100-60000
+> + 50004/50005 trên host. Lý do: bridge mode + iptables NAT bind
+> fail ngẫu nhiên khi range UDP overlap với Linux ephemeral port
+> range mặc định 32768-60999 (process khác trên host vô tình chiếm
+> port → Docker proxy bind fail). Production stack `dun-tunel/deploy`
+> cũng dùng cùng pattern này, đã document trong `.env.example`.
+
 Verify từ máy ngoài có thể chạm port:
 
 ```bash

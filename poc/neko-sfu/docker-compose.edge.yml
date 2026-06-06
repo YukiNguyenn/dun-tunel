@@ -24,31 +24,32 @@ services:
       dockerfile: Dockerfile.sfu
     container_name: poc-edge-sfu
     restart: unless-stopped
-    ports:
-      # Signalling: WS + REST. Public for browser viewer.
-      - "4443:4443"
-      # WebRtcTransport range cho viewer ICE/DTLS/SRTP. Mediasoup sẽ
-      # advertise candidate ip = SFU_PUBLIC_IP, port trong dải này.
-      # Phải nằm trong dải UDP đã mở firewall sẵn trên VPS (50000-60000).
-      # Pick 50100-60000 — đủ rộng cho hàng trăm viewer concurrent,
-      # chừa 50000-50099 cho plain RTP/RTCP để hai pool không đụng.
-      - "50100-60000:50100-60000/udp"
-      # PlainTransport RTP: owner Neko gửi VP8 vào đây, mediasoup
-      # comedia auto-detect remote (ip, port) từ packet đầu tiên.
-      # 50004/50005 nằm trong dải 50000-60000 đã mở firewall; con số
-      # cuối /4 + /5 giữ nguyên convention 5004/5005 quen thuộc.
-      - "50004:50004/udp"
-      - "50005:50005/udp"
+    # network_mode: host — mediasoup bind trực tiếp lên host network,
+    # không qua Docker bridge + iptables NAT. Bắt buộc khi range UDP
+    # lớn (50100-60000 = ~9900 ports) overlap với Linux ephemeral
+    # port range (32768-60999 default) — bridge mode `ports:` sẽ
+    # bind fail random với "address already in use" khi process khác
+    # trên host dùng port nào đó trong dải.
+    #
+    # Trade-off: container thấy host network nguyên si (4443, 50100-60000,
+    # 50004, 50005 đều bind trực tiếp host). Không cần `ports:` block.
+    network_mode: host
     environment:
       RUST_LOG: "info,mediasoup=info,sfu_main=debug"
+      # Phải là 0.0.0.0 để bind trên tất cả interface của host.
       SFU_LISTEN_HOST: "0.0.0.0"
       SFU_LISTEN_PORT: "4443"
       # CRITICAL: must be the VPS public IPv4. mediasoup advertises này
       # trong ICE candidate; nếu sai hoặc 127.0.0.1 thì viewer không
       # connect được transport.
       SFU_PUBLIC_IP: "${SFU_PUBLIC_IP:?SFU_PUBLIC_IP env required}"
+      # WebRtcTransport range cho viewer ICE/DTLS/SRTP — nằm trong
+      # dải UDP đã mở firewall sẵn (50000-60000). Pick 50100-60000,
+      # chừa 50000-50099 cho plain RTP/RTCP.
       SFU_RTC_PORT_MIN: "50100"
       SFU_RTC_PORT_MAX: "60000"
+      # PlainTransport RTP: owner Neko gửi VP8 vào đây, mediasoup
+      # comedia auto-detect remote (ip, port) từ packet đầu tiên.
       SFU_PLAIN_RTP_PORT: "50004"
       SFU_PLAIN_RTCP_PORT: "50005"
 
@@ -62,5 +63,7 @@ services:
       # Public — viewer page truy cập từ browser cá nhân (4G hoặc
       # mạng khác). Dùng 8091 vì 8090 đã bị dịch vụ khác trên VPS chiếm.
       - "8091:80"
-    depends_on:
-      - sfu
+    # Viewer là static page nginx, không cần host network. Không
+    # depends_on sfu vì sfu giờ chạy host network — viewer container
+    # chỉ là nginx phục vụ HTML+JS, browser của user connect SFU
+    # qua public IP trực tiếp, không qua docker DNS.
