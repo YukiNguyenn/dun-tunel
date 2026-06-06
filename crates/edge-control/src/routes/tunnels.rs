@@ -7,8 +7,7 @@ use axum::{
     Json,
 };
 use edge_shared::types::{
-    CaddyRoute, CreateSessionReq, CreateSessionResp, RatholeService, RatholeTransport,
-    SessionId,
+    CaddyRoute, CreateSessionReq, CreateSessionResp, RatholeService, SessionId,
 };
 use std::sync::Arc;
 
@@ -80,39 +79,29 @@ pub async fn create(
         }
     };
 
-    // 4b. Register UDP rathole service for the session's RTP stream.
+    // 4b. RTP transport — DIRECT UDP, not via rathole.
     //
-    // Architecture (Phase 2 task 10.B.1): Neko inside the owner's
-    // dun-browser container runs a GStreamer pipeline whose `udpsink`
-    // writes VP8 RTP packets to `127.0.0.1:5004`. The owner's rathole
-    // client tunnels that UDP stream to `0.0.0.0:<plain_rtp_port>` on
-    // this Edge_Server, where mediasoup's comedia-mode PlainTransport
-    // is already listening (created by `provision_session` in step 4).
+    // The previous design (Phase 2 task 10.B.1 draft) tried to tunnel
+    // VP8 RTP through a rathole UDP service block bound to the same
+    // port mediasoup's PlainTransport had just opened. That double
+    // bind is fundamentally impossible: two UDP sockets cannot share
+    // a port, so rathole-server fell into an infinite
+    // `Address already in use (os error 98). Retry...` loop while
+    // mediasoup held the port.
     //
-    // Failure here tears down everything from steps 2-4 so we never
-    // half-bind a session.
+    // The right architecture is direct UDP from owner → edge public
+    // IP on the `[plain_rtp_min, plain_rtp_max]` range (already open
+    // in the firewall). mediasoup comedia mode auto-detects the
+    // remote source from the first packet, so no out-of-band peer
+    // exchange is needed. Implementation lives in dun-share-tunnel
+    // when the GStreamer pipeline lands; until then this block is
+    // intentionally empty — the TCP rathole service from step 2
+    // covers control plane (HTTP/WS) which is the only thing
+    // exercised in Phase 1 + Phase 2 alpha.
     //
-    // Naming convention: `<session_id>-rtp` keeps the UDP service
-    // siblings with the TCP service in the rathole TOML and guarantees
-    // both share the same lifecycle in the registry.
-    let rtp_service_name = format!("{}-rtp", req.session_id);
-    if let Err(e) = state
-        .rathole
-        .register(RatholeService {
-            name: rtp_service_name.clone(),
-            token_hash: req.tunnel_token.clone(),
-            bind_addr: format!("0.0.0.0:{}", provisioned.plain_rtp_port),
-            transport: Some(RatholeTransport::Udp),
-        })
-        .await
-    {
-        tracing::error!(error = ?e, %req.session_id, "rathole UDP RTP register failed");
-        let _ = state.caddy.remove_route(&req.subdomain).await;
-        let _ = state.rathole.deregister(&req.session_id).await;
-        let _ = state.sfu.close_session(&req.session_id).await;
-        state.port_allocator.release(local_port).await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
+    // Keep `rtp_service_name` definition for symmetry with
+    // `deprovision`'s deregister call (idempotent — no-op when the
+    // service was never registered).
 
     // 5. Persist session_id → subdomain mapping so the deprovision
     //    handler can recover the Caddy route host. Without this the

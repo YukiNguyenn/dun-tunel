@@ -1,0 +1,55 @@
+# Neko v3 config cho PoC cross-NAT.
+#
+# Khác với same-machine (`neko-config.yaml`): udpsink host = ${SFU_PUBLIC_IP}
+# thay vì `sfu` (Docker DNS). entrypoint script render placeholder
+# trước khi Neko đọc file này.
+
+server:
+  bind: ":8080"
+
+session:
+  cookie:
+    enabled: false
+
+member:
+  provider: multiuser
+  multiuser:
+    user_password: "neko"
+    admin_password: "admin"
+
+desktop:
+  screen: "1280x720@30"
+
+webrtc:
+  # Native pion peer (cho :8080 UI) bind localhost — flow đó không
+  # phải là cái mình đang test. Test target là udpsink branch ↓.
+  nat1to1: ["127.0.0.1"]
+  epr: "59000-59100"
+
+capture:
+  video:
+    codec: vp8
+    ids: [main]
+    pipelines:
+      main:
+        show_pointer: true
+        gst_pipeline: |
+          ximagesrc display-name=:99 show-pointer=true use-damage=false
+            ! capsfilter caps=video/x-raw,framerate=30/1
+            ! videoconvert
+            ! queue
+            ! vp8enc
+                target-bitrate=2000000
+                cpu-used=4
+                end-usage=cbr
+                threads=4
+                deadline=1
+                keyframe-max-dist=25
+                min-quantizer=4
+                max-quantizer=20
+            ! tee name=t allow-not-linked=true
+            t. ! queue max-size-buffers=10 leaky=downstream ! appsink name=appsink
+            t. ! queue max-size-buffers=10 leaky=downstream
+               ! rtpvp8pay pt=96 ssrc=22222222 mtu=1200
+               ! udpsink host=__SFU_PUBLIC_IP__ port=5004 sync=false async=false
+                         buffer-size=2097152

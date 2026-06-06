@@ -1,0 +1,61 @@
+# Cross-NAT PoC — EDGE side (chạy trên VPS SIN, public IP).
+#
+# Mục đích: verify direct UDP từ owner Neko → edge mediasoup PlainTransport
+# qua public internet, không qua rathole/relay TCP. Owner ở mạng dân
+# dụng sau NAT, mediasoup comedia mode auto-detect remote source khi
+# packet đầu tiên đến.
+#
+# So với `docker-compose.yml` (same-machine): chỉ chạy 2 service `sfu`
+# + `viewer`, neko bỏ — neko sẽ chạy ở phía owner.
+#
+# Bring up trên VPS:
+#   export SFU_PUBLIC_IP=<vps_public_ip>
+#   docker compose -f docker-compose.edge.yml up -d --build
+#
+# Tear down:
+#   docker compose -f docker-compose.edge.yml down -v
+
+name: poc-neko-sfu-edge
+
+services:
+  sfu:
+    build:
+      context: .
+      dockerfile: Dockerfile.sfu
+    container_name: poc-edge-sfu
+    restart: unless-stopped
+    ports:
+      # Signalling: WS + REST. Public for browser viewer.
+      - "4443:4443"
+      # WebRtcTransport range cho viewer ICE/DTLS/SRTP. Mediasoup sẽ
+      # advertise candidate ip = SFU_PUBLIC_IP, port trong dải này.
+      - "40000-40100:40000-40100/udp"
+      # PlainTransport RTP: owner Neko gửi VP8 vào đây, mediasoup
+      # comedia auto-detect remote (ip, port) từ packet đầu tiên.
+      - "5004:5004/udp"
+      - "5005:5005/udp"
+    environment:
+      RUST_LOG: "info,mediasoup=info,sfu_main=debug"
+      SFU_LISTEN_HOST: "0.0.0.0"
+      SFU_LISTEN_PORT: "4443"
+      # CRITICAL: must be the VPS public IPv4. mediasoup advertises này
+      # trong ICE candidate; nếu sai hoặc 127.0.0.1 thì viewer không
+      # connect được transport.
+      SFU_PUBLIC_IP: "${SFU_PUBLIC_IP:?SFU_PUBLIC_IP env required}"
+      SFU_RTC_PORT_MIN: "40000"
+      SFU_RTC_PORT_MAX: "40100"
+      SFU_PLAIN_RTP_PORT: "5004"
+      SFU_PLAIN_RTCP_PORT: "5005"
+
+  viewer:
+    build:
+      context: ./viewer
+      dockerfile: Dockerfile
+    container_name: poc-edge-viewer
+    restart: unless-stopped
+    ports:
+      # Public — viewer page truy cập từ browser cá nhân (4G hoặc
+      # mạng khác).
+      - "8090:80"
+    depends_on:
+      - sfu

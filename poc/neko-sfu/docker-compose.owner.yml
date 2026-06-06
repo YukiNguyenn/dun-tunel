@@ -1,0 +1,50 @@
+# Cross-NAT PoC — OWNER side (chạy trên máy remote sau NAT).
+#
+# Mục đích: chạy Neko với GStreamer pipeline tách 2 nhánh:
+#   - appsink branch — Neko's pion peer connection, dùng cho native
+#     viewer truy cập :8080 (giữ nguyên hành vi, không gãy).
+#   - udpsink branch — push VP8 RTP DIRECT UDP sang edge VPS public
+#     IP:5004 (mediasoup PlainTransport comedia mode lock peer khi
+#     nhận packet đầu).
+#
+# So với `docker-compose.yml` (same-machine): chỉ chạy `neko`, dùng
+# config khác (`neko-config.cross-nat.yaml`) để substitute
+# `host=${SFU_PUBLIC_IP}` thay vì `host=sfu`.
+#
+# Bring up:
+#   export SFU_PUBLIC_IP=<edge_vps_public_ip>
+#   docker compose -f docker-compose.owner.yml up -d --build
+#
+# Verify pipeline emit:
+#   docker logs poc-owner-neko 2>&1 | grep -iE "udpsink|rtpvp8pay|pipeline"
+#
+# Tear down:
+#   docker compose -f docker-compose.owner.yml down -v
+
+name: poc-neko-sfu-owner
+
+services:
+  neko:
+    image: m1k1o/neko:firefox
+    container_name: poc-owner-neko
+    restart: unless-stopped
+    shm_size: 2gb
+    ports:
+      - "8080:8080"
+      # Neko native pion EPR — chỉ cần cho user của Neko :8080 (không
+      # phải share viewer). Có thể bỏ nếu không test native flow.
+      - "59000-59100:59000-59100/udp"
+    environment:
+      DISPLAY: ":99"
+      # Verbose log nhánh udpsink để debug khi RTP không đến edge.
+      GST_DEBUG: "udpsink:5,rtpvp8pay:4,tee:4,queue:3,vp8enc:3,3"
+      # SFU_PUBLIC_IP truyền sang neko-config.cross-nat.yaml qua
+      # template render (entrypoint trong tmpfs). Required.
+      SFU_PUBLIC_IP: "${SFU_PUBLIC_IP:?SFU_PUBLIC_IP env required}"
+      NEKO_CONFIG: "/etc/neko/neko.yaml"
+    volumes:
+      # Mount template; entrypoint sẽ envsubst SFU_PUBLIC_IP vào
+      # /etc/neko/neko.yaml trước khi gọi neko binary.
+      - ./neko-config.cross-nat.yaml:/etc/neko/neko.yaml.tpl:ro
+      - ./neko-cross-nat-entrypoint.sh:/neko-cross-nat-entrypoint.sh:ro
+    entrypoint: ["/neko-cross-nat-entrypoint.sh"]
