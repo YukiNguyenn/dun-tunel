@@ -29,11 +29,16 @@ services:
       - "4443:4443"
       # WebRtcTransport range cho viewer ICE/DTLS/SRTP. Mediasoup sẽ
       # advertise candidate ip = SFU_PUBLIC_IP, port trong dải này.
-      - "40000-40100:40000-40100/udp"
+      # Phải nằm trong dải UDP đã mở firewall sẵn trên VPS (50000-60000).
+      # Pick 50100-60000 — đủ rộng cho hàng trăm viewer concurrent,
+      # chừa 50000-50099 cho plain RTP/RTCP để hai pool không đụng.
+      - "50100-60000:50100-60000/udp"
       # PlainTransport RTP: owner Neko gửi VP8 vào đây, mediasoup
       # comedia auto-detect remote (ip, port) từ packet đầu tiên.
-      - "5004:5004/udp"
-      - "5005:5005/udp"
+      # 50004/50005 nằm trong dải 50000-60000 đã mở firewall; con số
+      # cuối /4 + /5 giữ nguyên convention 5004/5005 quen thuộc.
+      - "50004:50004/udp"
+      - "50005:50005/udp"
     environment:
       RUST_LOG: "info,mediasoup=info,sfu_main=debug"
       SFU_LISTEN_HOST: "0.0.0.0"
@@ -42,10 +47,10 @@ services:
       # trong ICE candidate; nếu sai hoặc 127.0.0.1 thì viewer không
       # connect được transport.
       SFU_PUBLIC_IP: "${SFU_PUBLIC_IP:?SFU_PUBLIC_IP env required}"
-      SFU_RTC_PORT_MIN: "40000"
-      SFU_RTC_PORT_MAX: "40100"
-      SFU_PLAIN_RTP_PORT: "5004"
-      SFU_PLAIN_RTCP_PORT: "5005"
+      SFU_RTC_PORT_MIN: "50100"
+      SFU_RTC_PORT_MAX: "60000"
+      SFU_PLAIN_RTP_PORT: "50004"
+      SFU_PLAIN_RTCP_PORT: "50005"
 
   viewer:
     build:
@@ -55,7 +60,7 @@ services:
     restart: unless-stopped
     ports:
       # Public — viewer page truy cập từ browser cá nhân (4G hoặc
-      # mạng khác).
-      - "8090:80"
+      # mạng khác). Dùng 8091 vì 8090 đã bị dịch vụ khác trên VPS chiếm.
+      - "8091:80"
     depends_on:
       - sfu

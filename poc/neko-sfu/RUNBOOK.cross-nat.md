@@ -10,15 +10,15 @@
 │  Owner máy remote    │                           │  Edge VPS — SIN      │
 │  (sau NAT 192.168.x) │                           │  (public IPv4)       │
 │                      │                           │                      │
-│  poc-owner-neko      │── direct UDP RTP :5004 ──▶│  poc-edge-sfu        │
+│  poc-owner-neko      │── direct UDP RTP :50004 ─▶│  poc-edge-sfu        │
 │  Neko firefox        │                           │  PlainTransport      │
 │  GStreamer pipeline  │                           │  comedia=true        │
-│  udpsink host=<vps>  │                           │  bind 0.0.0.0:5004   │
+│  udpsink host=<vps>  │                           │  bind 0.0.0.0:50004  │
 │                      │                           │                      │
 └──────────────────────┘                           │  poc-edge-viewer     │
-                                                   │  http :8090          │
+                                                   │  http :8091          │
         Browser viewer cá nhân ─────HTTP/WS────────▶  http :4443          │
-        (mạng khác bất kỳ)         WebRTC ICE/SRTP   (UDP 40000-40100)    │
+        (mạng khác bất kỳ)         WebRTC ICE/SRTP   (UDP 50100-60000)    │
                                                    └──────────────────────┘
 ```
 
@@ -26,15 +26,18 @@
 
 ## Bước 1 — Edge VPS (SIN) firewall
 
-SSH vào VPS SIN. Verify ports đã mở. Chạy:
+SSH vào VPS SIN. Verify ports đã mở. Chỉ cần 2 TCP port mới —
+**dải UDP 50000-60000 đã được mở sẵn trên VPS**, plain RTP/RTCP
++ WebRtcTransport range đều nằm gọn trong dải đó.
 
 ```bash
-# Public ports cần thiết cho PoC
+# TCP — signalling + viewer page
 sudo ufw allow 4443/tcp comment 'PoC SFU signalling'
-sudo ufw allow 8090/tcp comment 'PoC viewer page'
-sudo ufw allow 5004/udp comment 'PoC plain RTP from owner'
-sudo ufw allow 5005/udp comment 'PoC plain RTCP'
-sudo ufw allow 40000:40100/udp comment 'PoC viewer WebRtcTransport'
+sudo ufw allow 8091/tcp comment 'PoC viewer page'
+
+# Verify dải UDP 50000-60000 đã mở (đã setup từ trước):
+sudo ufw status numbered | grep -E '50000|60000|udp'
+
 sudo ufw status numbered
 ```
 
@@ -45,7 +48,7 @@ Verify từ máy ngoài có thể chạm port:
 
 ```bash
 nc -zv <vps_public_ip> 4443     # phải success
-nc -zuv <vps_public_ip> 5004    # UDP success (vẫn báo open vì OS chưa drop)
+nc -zuv <vps_public_ip> 50004   # UDP success (vẫn báo open vì OS chưa drop)
 ```
 
 ---
@@ -78,14 +81,14 @@ docker logs poc-edge-sfu 2>&1 | grep "PoC SFU listening"
 # Phải thấy: "PoC SFU listening :4443 | announced_ip=<vps_public_ip> | ..."
 
 # Verify viewer page reach được:
-curl -I http://localhost:8090
+curl -I http://localhost:8091
 # 200 OK
 ```
 
 Test signalling từ browser cá nhân của bạn:
 
 ```
-mở trình duyệt → http://<vps_public_ip>:8090
+mở trình duyệt → http://<vps_public_ip>:8091
 trang load OK, có ô input + button "connect & consume"
 ```
 
@@ -118,7 +121,7 @@ docker compose -f docker-compose.owner.yml up -d --build
 
 # Verify pipeline được render đúng:
 docker logs poc-owner-neko 2>&1 | grep "udpsink target line"
-# Phải thấy: "udpsink host=<vps_public_ip> port=5004 ..."
+# Phải thấy: "udpsink host=<vps_public_ip> port=50004 ..."
 
 # Verify Neko bind localhost (cho :8080 UI). Mở browser owner:
 #   http://localhost:8080  → login neko/neko
@@ -141,7 +144,7 @@ Trong vòng ~3-5 giây sau khi click vào Neko UI :8080 ở máy owner,
 phải thấy log dạng:
 
 ```
-plain transport listening rtp=:5004 rtcp=:5005
+plain transport listening rtp=:50004 rtcp=:50005
 plain producer id=<uuid> kind=video
 plain producer stats: RtpStreamRecv { ssrc: 22222222, kind: Video, ... }
 plain producer score update: ssrc=22222222 score=10
@@ -152,13 +155,13 @@ Nếu **không** thấy stats:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Stats luôn `(no streams seen yet)` | Owner Neko chưa fire pipeline | Mở browser :8080 trên máy owner và click vào page |
-| Stats vẫn rỗng sau 30s click | UDP packet không tới VPS | `tcpdump -i any -nn 'udp port 5004'` trên VPS |
+| Stats vẫn rỗng sau 30s click | UDP packet không tới VPS | `tcpdump -i any -nn 'udp port 50004'` trên VPS |
 | `tcpdump` thấy packet nhưng score=0 | RTP format sai | Verify `ssrc=22222222 pt=96` trong log GStreamer |
 
 `tcpdump` sniff trên VPS để confirm UDP đến từ public internet:
 
 ```bash
-sudo tcpdump -i any -nn 'udp port 5004' -c 30
+sudo tcpdump -i any -nn 'udp port 50004' -c 30
 # Phải thấy nguồn IP = NAT công cộng của owner network
 # (KHÔNG phải private 192.168.x.x — NAT đã rewrite source)
 ```
@@ -169,7 +172,7 @@ sudo tcpdump -i any -nn 'udp port 5004' -c 30
 
 Trên **một máy khác hoàn toàn** (laptop bạn ở mạng khác, hoặc điện thoại 4G):
 
-1. Mở `http://<vps_public_ip>:8090`
+1. Mở `http://<vps_public_ip>:8091`
 2. Click `connect & consume`.
 3. Quan sát log trên page — phải thấy chuỗi:
    ```
@@ -207,11 +210,11 @@ Trên **một máy khác hoàn toàn** (laptop bạn ở mạng khác, hoặc đ
 Nếu owner gửi UDP nhưng edge không nhận được (firewall, ISP block, NAT
 quá khắt khe), thử trong order:
 
-1. UDP probe ngược chiều: trên VPS chạy `nc -ul 5004`, máy owner
-   `echo hello | nc -u <vps_ip> 5004` → nếu nhận được, vấn đề ở
+1. UDP probe ngược chiều: trên VPS chạy `nc -ul 50004`, máy owner
+   `echo hello | nc -u <vps_ip> 50004` → nếu nhận được, vấn đề ở
    Neko pipeline, không phải network.
-2. Đổi port 5004 → 5006: một số ISP residential block port chẵn dưới
-   1024 + một vài port magic.
+2. Đổi port 50004 → 50006: hiếm khi cần, nhưng test khi nghi ngờ
+   ngẫu nhiên.
 3. Nếu fail tất cả: ISP block UDP outbound — fallback sang TURN
    relay (coturn deploy + force ICE qua TURN). Đó là Phase 3+.
 
@@ -224,10 +227,8 @@ VPS:
 ```bash
 docker compose -f docker-compose.edge.yml down -v
 sudo ufw delete allow 4443/tcp
-sudo ufw delete allow 8090/tcp
-sudo ufw delete allow 5004/udp
-sudo ufw delete allow 5005/udp
-sudo ufw delete allow 40000:40100/udp
+sudo ufw delete allow 8091/tcp
+# Dải UDP 50000-60000 KHÔNG xoá — đó là rule global đã có sẵn.
 ```
 
 Owner:
@@ -248,7 +249,8 @@ Báo lại tôi kết quả. Tùy kết quả, tôi sẽ:
   - dun-app `ShareTunnelService` cache + truyền vào dun-browser
   - dun-browser: tách neko-config thành template per-share-session,
     udpsink host = edge public IP của region đã pick.
-  - Mở firewall `udp/5000-9999` + `udp/40000-60000` ở edge production.
+  - Mở firewall `udp/50000-60000` ở edge production (đã sẵn — match dải
+    PoC này dùng).
 
 - **FAIL** → diagnose UDP path cụ thể, có thể cần TURN relay từ ngày
   một thay vì defer Phase 3.

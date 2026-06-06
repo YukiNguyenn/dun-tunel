@@ -51,5 +51,5 @@ capture:
             t. ! queue max-size-buffers=10 leaky=downstream ! appsink name=appsink
             t. ! queue max-size-buffers=10 leaky=downstream
                ! rtpvp8pay pt=96 ssrc=22222222 mtu=1200
-               ! udpsink host=__SFU_PUBLIC_IP__ port=5004 sync=false async=false
+               ! udpsink host=__SFU_PUBLIC_IP__ port=50004 sync=false async=false
                          buffer-size=2097152
