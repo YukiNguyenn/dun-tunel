@@ -4,19 +4,17 @@
 #   - appsink branch — Neko's pion peer connection, dùng cho native
 #     viewer truy cập :8080 (giữ nguyên hành vi, không gãy).
 #   - udpsink branch — push VP8 RTP DIRECT UDP sang edge VPS public
-#     IP:5004 (mediasoup PlainTransport comedia mode lock peer khi
+#     IP:50004 (mediasoup PlainTransport comedia mode lock peer khi
 #     nhận packet đầu).
 #
-# So với `docker-compose.yml` (same-machine): chỉ chạy `neko`, dùng
-# config khác (`neko-config.cross-nat.yaml`) để substitute
-# `host=${SFU_PUBLIC_IP}` thay vì `host=sfu`.
+# Bring up (chạy script wrapper, render config + up):
+#   ./start-owner.sh <edge_public_ip>
 #
-# Bring up:
-#   export SFU_PUBLIC_IP=<edge_vps_public_ip>
+# Hoặc thủ công:
+#   export SFU_PUBLIC_IP=<edge_public_ip>
+#   sed "s/__SFU_PUBLIC_IP__/$SFU_PUBLIC_IP/g" \
+#       neko-config.cross-nat.yaml > .neko-rendered.yaml
 #   docker compose -f docker-compose.owner.yml up -d --build
-#
-# Verify pipeline emit:
-#   docker logs poc-owner-neko 2>&1 | grep -iE "udpsink|rtpvp8pay|pipeline"
 #
 # Tear down:
 #   docker compose -f docker-compose.owner.yml down -v
@@ -38,13 +36,9 @@ services:
       DISPLAY: ":99"
       # Verbose log nhánh udpsink để debug khi RTP không đến edge.
       GST_DEBUG: "udpsink:5,rtpvp8pay:4,tee:4,queue:3,vp8enc:3,3"
-      # SFU_PUBLIC_IP truyền sang neko-config.cross-nat.yaml qua
-      # template render (entrypoint trong tmpfs). Required.
-      SFU_PUBLIC_IP: "${SFU_PUBLIC_IP:?SFU_PUBLIC_IP env required}"
       NEKO_CONFIG: "/etc/neko/neko.yaml"
     volumes:
-      # Mount template; entrypoint sẽ envsubst SFU_PUBLIC_IP vào
-      # /etc/neko/neko.yaml trước khi gọi neko binary.
-      - ./neko-config.cross-nat.yaml:/etc/neko/neko.yaml.tpl:ro
-      - ./neko-cross-nat-entrypoint.sh:/neko-cross-nat-entrypoint.sh:ro
-    entrypoint: ["/neko-cross-nat-entrypoint.sh"]
+      # Mount file đã render sẵn placeholder (do `start-owner.sh`
+      # hoặc `sed` thủ công sinh ra). Không dùng entrypoint override
+      # nữa vì race condition Xorg + neko trên Linux strict.
+      - ./.neko-rendered.yaml:/etc/neko/neko.yaml:ro

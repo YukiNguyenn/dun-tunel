@@ -215,16 +215,47 @@ Trên **một máy khác hoàn toàn** (laptop bạn ở mạng khác, hoặc đ
 
 ## FAIL fallback
 
-Nếu owner gửi UDP nhưng edge không nhận được (firewall, ISP block, NAT
-quá khắt khe), thử trong order:
+### A. Owner và edge cùng public IP (hairpin NAT issue)
 
-1. UDP probe ngược chiều: trên VPS chạy `nc -ul 50004`, máy owner
-   `echo hello | nc -u <vps_ip> 50004` → nếu nhận được, vấn đề ở
-   Neko pipeline, không phải network.
-2. Đổi port 50004 → 50006: hiếm khi cần, nhưng test khi nghi ngờ
-   ngẫu nhiên.
-3. Nếu fail tất cả: ISP block UDP outbound — fallback sang TURN
-   relay (coturn deploy + force ICE qua TURN). Đó là Phase 3+.
+Một loop xảy ra khi máy owner và VPS edge có cùng public IP (ví dụ
+chung 1 cloud provider, chung 1 NAT pool, hoặc đang VPN). Symptom:
+- `curl ifconfig.me` trên owner và VPS trả cùng IP
+- Owner gửi UDP đến `<edge_public_ip>:50004` nhưng tcpdump VPS không
+  thấy packet (kernel hoặc router chặn route loop)
+- Nhưng TCP 4443 vẫn work bình thường
+
+Test:
+```bash
+# Trên cả 2 máy
+curl -s https://api.ipify.org && echo
+```
+Nếu output trùng → owner machine không phải cross-NAT thật. Plan:
+- Dùng máy KHÁC mạng làm owner (4G phone, laptop ở quán cà phê, máy nhà
+  bạn bè).
+- Hoặc nếu VPS hỗ trợ private networking, test loopback qua private IP
+  thay vì public.
+
+### B. Provider firewall (UFW disabled, có lớp ngoài)
+
+Nếu UFW inactive nhưng owner ngoài mạng vẫn fail UDP:
+- Liên hệ provider mở thêm dải UDP cho VPS này (50000-60000/udp).
+- Provider VN nhỏ thường yêu cầu ticket; cloud lớn (DigitalOcean,
+  Hetzner) có cloud panel mở rule.
+
+### C. ISP block UDP outbound
+
+Hiếm nhưng tồn tại — fallback sang TURN relay (coturn deploy + force
+ICE qua TURN). Đó là Phase 3+.
+
+### D. Pipeline emit OK nhưng mediasoup không nhận
+
+Verify trong container Neko:
+```bash
+docker exec poc-owner-neko apt-get install -y tcpdump
+docker exec poc-owner-neko sh -c "timeout 5 tcpdump -i any -nn 'udp port 50004' -c 10"
+```
+Nếu thấy packet egress từ container `eth0 Out IP 172.x.x.x.PORT > <vps>:50004`
+→ pipeline OK, vấn đề ở network giữa owner và VPS.
 
 ---
 
