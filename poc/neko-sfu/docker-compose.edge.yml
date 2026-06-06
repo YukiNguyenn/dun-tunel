@@ -44,10 +44,15 @@ services:
       # connect được transport.
       SFU_PUBLIC_IP: "${SFU_PUBLIC_IP:?SFU_PUBLIC_IP env required}"
       # WebRtcTransport range cho viewer ICE/DTLS/SRTP — nằm trong
-      # dải UDP đã mở firewall sẵn (50000-60000). Pick 50100-60000,
+      # dải UDP đã mở firewall sẵn (50000-60000). Pick 50100-50200,
       # chừa 50000-50099 cho plain RTP/RTCP.
+      #
+      # Dải 50100-50200 = 101 port = 50 viewer concurrent (2
+      # transport mỗi viewer: consumer + input). Đủ cho PoC + small
+      # production. Nếu cần scale lớn hơn, tăng MAX về 60000 sau
+      # khi liên hệ provider confirm forward.
       SFU_RTC_PORT_MIN: "50100"
-      SFU_RTC_PORT_MAX: "60000"
+      SFU_RTC_PORT_MAX: "50200"
       # PlainTransport RTP: owner Neko gửi VP8 vào đây, mediasoup
       # comedia auto-detect remote (ip, port) từ packet đầu tiên.
       SFU_PLAIN_RTP_PORT: "50004"
