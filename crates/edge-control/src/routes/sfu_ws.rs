@@ -45,12 +45,12 @@ use axum::{
     response::IntoResponse,
 };
 use edge_callback_client::Client as CallbackClient;
-use edge_sfu::{ConsumedInfo, ConsumerTransportInfo, RouterManager};
+use edge_sfu::{
+    ConsumedInfo, ConsumerId, ConsumerTransportInfo, DtlsParameters, IceCandidate,
+    IceParameters, ProducerId, RouterManager, RtpCapabilities,
+    RtpCapabilitiesFinalized, TransportId,
+};
 use edge_shared::types::EdgeCallbackEvent;
-use mediasoup::consumer::ConsumerId;
-use mediasoup::prelude::*;
-use mediasoup::producer::ProducerId;
-use mediasoup::transport::TransportId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
