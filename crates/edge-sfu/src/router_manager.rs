@@ -17,7 +17,7 @@
 
 use crate::transport::{
     create_consumer_transport_options, create_plain_transport_options,
-    plain_producer_rtp_parameters, RouterListenInfo,
+    plain_audio_producer_rtp_parameters, plain_producer_rtp_parameters, RouterListenInfo,
 };
 use crate::VIEWER_CAP_PER_SESSION;
 use anyhow::Context;
@@ -41,6 +41,10 @@ pub struct SessionState {
     pub router: Router,
     /// Producer + the transport feeding it (held to keep the producer alive).
     pub plain_producer: Option<Producer>,
+    /// Opus audio producer fed by the SAME PlainTransport (second
+    /// SSRC/payload type). Optional because older sessions / pipelines
+    /// without an audio branch still work video-only.
+    pub plain_audio_producer: Option<Producer>,
     pub _plain_transport: Option<PlainTransport>,
     /// Per-viewer entries keyed by an opaque viewer id (e.g. WebRTC session
     /// fingerprint or a UUID we mint on accept).
@@ -87,6 +91,8 @@ pub struct ProvisionedRouter {
     pub plain_rtp_port: u16,
     pub plain_rtcp_port: u16,
     pub producer_id: ProducerId,
+    /// Opus audio producer id, when the session has an audio branch.
+    pub audio_producer_id: Option<ProducerId>,
     pub rtp_capabilities: RtpCapabilitiesFinalized,
 }
 
@@ -176,6 +182,18 @@ impl RouterManager {
             .await
             .context("produce on plain transport")?;
 
+        // Audio producer on the SAME PlainTransport. The GStreamer
+        // pipeline funnels both VP8 (pt=96 ssrc=22222222) and Opus
+        // (pt=111 ssrc=22222223) RTP into the one UDP port; mediasoup
+        // demuxes by SSRC. If the owner's pipeline has no audio branch
+        // (older dun-app), no Opus packets ever arrive and this
+        // producer simply stays silent — harmless.
+        let audio_rtp_parameters = plain_audio_producer_rtp_parameters();
+        let audio_producer = plain_transport
+            .produce(ProducerOptions::new(MediaKind::Audio, audio_rtp_parameters))
+            .await
+            .context("produce audio on plain transport")?;
+
         let plain_rtp_port = plain_transport.tuple().local_port();
         let plain_rtcp_port = plain_transport
             .rtcp_tuple()
@@ -187,6 +205,7 @@ impl RouterManager {
             plain_rtp_port,
             plain_rtcp_port,
             producer_id: producer.id(),
+            audio_producer_id: Some(audio_producer.id()),
             rtp_capabilities: router.rtp_capabilities().clone(),
         };
 
@@ -194,6 +213,7 @@ impl RouterManager {
             session_id: session_id.to_string(),
             router,
             plain_producer: Some(producer),
+            plain_audio_producer: Some(audio_producer),
             _plain_transport: Some(plain_transport),
             viewers: HashMap::new(),
             _cumulative_bytes_cache: Mutex::new(0),
@@ -339,10 +359,13 @@ impl RouterManager {
     /// The WS signaling handler needs both during the `Init` exchange so
     /// the mediasoup-client can call `loadDevice(routerRtpCapabilities)`
     /// and `consume(producerId)` without an extra round-trip.
+    ///
+    /// Returns `(video_producer_id, audio_producer_id, caps)`. The audio
+    /// id is `None` for sessions provisioned before audio support.
     pub async fn session_producer_info(
         &self,
         session_id: &str,
-    ) -> anyhow::Result<(ProducerId, RtpCapabilitiesFinalized)> {
+    ) -> anyhow::Result<(ProducerId, Option<ProducerId>, RtpCapabilitiesFinalized)> {
         let state = self
             .inner
             .sessions
@@ -354,7 +377,12 @@ impl RouterManager {
             .plain_producer
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("plain producer absent"))?;
-        Ok((producer.id(), guard.router.rtp_capabilities().clone()))
+        let audio_producer_id = guard.plain_audio_producer.as_ref().map(|p| p.id());
+        Ok((
+            producer.id(),
+            audio_producer_id,
+            guard.router.rtp_capabilities().clone(),
+        ))
     }
 
     /// Connect a viewer's recv-side WebRtcTransport with the DTLS
@@ -522,6 +550,7 @@ fn snapshot(state: &SessionState) -> ProvisionedRouter {
         plain_rtp_port,
         plain_rtcp_port,
         producer_id: producer.id(),
+        audio_producer_id: state.plain_audio_producer.as_ref().map(|p| p.id()),
         rtp_capabilities: router.rtp_capabilities().clone(),
     }
 }

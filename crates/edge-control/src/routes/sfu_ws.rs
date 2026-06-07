@@ -298,9 +298,10 @@ async fn run_session(
         );
     }
 
-    let (producer_id, router_caps) = sfu.session_producer_info(&session_id).await?;
+    let (producer_id, audio_producer_id, router_caps) =
+        sfu.session_producer_info(&session_id).await?;
 
-    let init = build_init_payload(recv_info, producer_id, router_caps);
+    let init = build_init_payload(recv_info, producer_id, audio_producer_id, router_caps);
     socket.send(Message::Text(init.to_string())).await?;
 
     // Holder for the client's RTP capabilities (sent via the Init
@@ -412,6 +413,7 @@ async fn run_session(
 fn build_init_payload(
     recv_info: ConsumerTransportInfo,
     producer_id: ProducerId,
+    audio_producer_id: Option<ProducerId>,
     router_caps: RtpCapabilitiesFinalized,
 ) -> serde_json::Value {
     let opts = InitTransportOptions::from(recv_info);
@@ -423,6 +425,10 @@ fn build_init_payload(
         // omit the field; mediasoup-client treats it as undefined.
         "routerRtpCapabilities": router_caps,
         "plainProducerId": producer_id,
+        // Opus audio producer on the same PlainTransport. `null` when
+        // the session has no audio branch — the viewer client just
+        // skips the audio Consume in that case.
+        "audioProducerId": audio_producer_id,
     })
 }
 

@@ -9,7 +9,7 @@ use mediasoup::prelude::*;
 use mediasoup_types::data_structures::Protocol;
 use std::env;
 use std::net::IpAddr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU8};
 
 const DEFAULT_RTC_MIN_PORT: u16 = 50_000;
 const DEFAULT_RTC_MAX_PORT: u16 = 60_000;
@@ -46,6 +46,17 @@ pub const PLAIN_PAYLOAD_TYPE: u8 = 96;
 const PLAIN_CLOCK_RATE: u32 = 90_000;
 /// Fixed RTP SSRC the Producer is bound to (Neko `udpsink ssrc=22222222`).
 pub const PLAIN_SSRC: u32 = 22_222_222;
+
+/// RTP payload type for the Opus audio producer fed by the GStreamer
+/// `rtpopuspay pt=111` branch. Audio + video share ONE PlainTransport
+/// (one UDP port, comedia mode) and are demultiplexed by SSRC + payload
+/// type — so the audio PT/SSRC MUST differ from the video ones above.
+pub const PLAIN_AUDIO_PAYLOAD_TYPE: u8 = 111;
+const PLAIN_AUDIO_CLOCK_RATE: u32 = 48_000;
+/// Fixed RTP SSRC for the audio producer (GStreamer
+/// `rtpopuspay ... ssrc=22222223`). One more than the video SSRC so the
+/// two streams never collide on the shared transport.
+pub const PLAIN_AUDIO_SSRC: u32 = 22_222_223;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RouterListenInfo {
@@ -147,6 +158,31 @@ pub fn plain_producer_rtp_parameters() -> RtpParameters {
         header_extensions: vec![],
         encodings: vec![RtpEncodingParameters {
             ssrc: Some(PLAIN_SSRC),
+            ..RtpEncodingParameters::default()
+        }],
+        rtcp: RtcpParameters::default(),
+        msid: None,
+    }
+}
+
+/// RTP parameters of the Opus audio producer fed by the GStreamer
+/// `rtpopuspay pt=111 ssrc=22222223` branch on the SAME PlainTransport.
+/// Stereo, 48 kHz, in-band FEC — mirrors Neko's own opus encode so the
+/// viewer hears the same audio as the host.
+pub fn plain_audio_producer_rtp_parameters() -> RtpParameters {
+    RtpParameters {
+        mid: None,
+        codecs: vec![RtpCodecParameters::Audio {
+            mime_type: MimeTypeAudio::Opus,
+            payload_type: PLAIN_AUDIO_PAYLOAD_TYPE,
+            clock_rate: NonZeroU32::new(PLAIN_AUDIO_CLOCK_RATE).unwrap(),
+            channels: NonZeroU8::new(2).unwrap(),
+            parameters: RtpCodecParametersParameters::from([("useinbandfec", 1_u32.into())]),
+            rtcp_feedback: vec![],
+        }],
+        header_extensions: vec![],
+        encodings: vec![RtpEncodingParameters {
+            ssrc: Some(PLAIN_AUDIO_SSRC),
             ..RtpEncodingParameters::default()
         }],
         rtcp: RtcpParameters::default(),
