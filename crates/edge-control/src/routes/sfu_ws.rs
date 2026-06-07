@@ -301,6 +301,12 @@ async fn run_session(
     let (producer_id, audio_producer_id, router_caps) =
         sfu.session_producer_info(&session_id).await?;
 
+    tracing::info!(
+        %session_id, %viewer_id,
+        has_audio = audio_producer_id.is_some(),
+        "sending Init to viewer"
+    );
+
     let init = build_init_payload(recv_info, producer_id, audio_producer_id, router_caps);
     socket.send(Message::Text(init.to_string())).await?;
 

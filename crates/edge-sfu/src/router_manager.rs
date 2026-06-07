@@ -226,6 +226,7 @@ impl RouterManager {
             %session_id,
             router_id = %provisioned.router_id,
             plain_rtp_port,
+            audio_producer = provisioned.audio_producer_id.is_some(),
             "session provisioned"
         );
         Ok(provisioned)
