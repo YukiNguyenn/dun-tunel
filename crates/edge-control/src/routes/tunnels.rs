@@ -139,6 +139,15 @@ pub async fn create(
         .unwrap_or_default(),
         consumer_template_encrypted: String::new(),
         local_upstream_port: local_port,
+        // Direct-UDP media ingest (Phase 2 SFU). The owner's GStreamer
+        // udpsink targets `<edge_public_host>:<media_rtp_port>`; dun-api
+        // fills in the host from the region map since edge-control sits
+        // behind NAT. RTP payload type + ssrc come from the single
+        // source of truth in edge-sfu so Neko's rtpvp8pay matches the
+        // Producer the SFU created.
+        media_rtp_port: Some(provisioned.plain_rtp_port),
+        media_payload_type: Some(edge_sfu::PLAIN_PAYLOAD_TYPE),
+        media_ssrc: Some(edge_sfu::PLAIN_SSRC),
     }))
 }
 

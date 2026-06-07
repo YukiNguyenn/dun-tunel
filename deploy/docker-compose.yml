@@ -38,6 +38,22 @@ services:
       # Caddyfile.tpl).
       SHARE_TUNNEL_DOMAIN: ${SHARE_TUNNEL_DOMAIN:?SHARE_TUNNEL_DOMAIN required}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN required}
+      # ─── SFU media (Phase 2 direct-UDP) ──────────────────────────
+      # Owner Neko udpsink → mediasoup PlainTransport (comedia). Viewer
+      # WebRtcTransport ICE/SRTP uses the RTC range. All ports MUST sit
+      # inside the UDP range the hosting provider forwards to this VPS
+      # (PoC verified provider forwards 50000-60000; coordinate before
+      # changing). announced_ip is the edge PUBLIC IPv4 the viewer's
+      # browser + owner's udpsink target — NOT the private NAT address.
+      SFU_ANNOUNCED_IP: ${SFU_ANNOUNCED_IP:?SFU_ANNOUNCED_IP required (edge public IPv4)}
+      SFU_LISTEN_IP: ${SFU_LISTEN_IP:-0.0.0.0}
+      # Plain RTP/RTCP producer-ingest pool (owner → SFU). 50000-50099.
+      SFU_PLAIN_RTP_MIN_PORT: ${SFU_PLAIN_RTP_MIN_PORT:-50000}
+      SFU_PLAIN_RTP_MAX_PORT: ${SFU_PLAIN_RTP_MAX_PORT:-50099}
+      # Viewer WebRtcTransport pool (SFU → viewers). 50100-59999 = ~5000
+      # ports ≈ 2500 concurrent viewers (2 transports each).
+      SFU_RTC_MIN_PORT: ${SFU_RTC_MIN_PORT:-50100}
+      SFU_RTC_MAX_PORT: ${SFU_RTC_MAX_PORT:-59999}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       # Read-write: bridge rewrite rathole config + persist sequence

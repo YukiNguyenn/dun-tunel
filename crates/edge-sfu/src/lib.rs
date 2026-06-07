@@ -16,7 +16,7 @@ pub use router_manager::{
     ViewerSlot,
 };
 pub use snapshot_reporter::SessionSnapshotReporter;
-pub use transport::RouterListenInfo;
+pub use transport::{RouterListenInfo, PLAIN_PAYLOAD_TYPE, PLAIN_SSRC};
 
 /// Re-export of mediasoup types needed by callers (edge-control's
 /// SFU WS handler) so they don't have to depend on the heavy

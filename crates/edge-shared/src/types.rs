@@ -42,6 +42,21 @@ pub struct CreateSessionResp {
     /// Consumer template encrypted
     pub consumer_template_encrypted: String,
     pub local_upstream_port: u16,
+    /// Media ingest endpoint for the owner's Neko GStreamer udpsink
+    /// (Phase 2 SFU, direct-UDP architecture). The owner pushes VP8 RTP
+    /// to `<edge_public_host>:<media_rtp_port>` where mediasoup's
+    /// comedia-mode PlainTransport auto-detects the remote peer. Host is
+    /// resolved by dun-api from the region (edge-control sits behind NAT
+    /// and only knows its private IP), so we only carry the port + RTP
+    /// shape here. `None` for legacy/unprovisioned sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_rtp_port: Option<u16>,
+    /// RTP payload type the SFU PlainTransport Producer expects (VP8 = 96).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_payload_type: Option<u8>,
+    /// Fixed RTP SSRC the SFU Producer is bound to (matches Neko udpsink).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_ssrc: Option<u32>,
 }
 
 /// State snapshot endpoint cho reconciliation job (R22).

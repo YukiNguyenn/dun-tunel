@@ -38,9 +38,14 @@ const DEFAULT_RTC_MAX_PORT: u16 = 60_000;
 const DEFAULT_PLAIN_RTP_MIN_PORT: u16 = 5_000;
 const DEFAULT_PLAIN_RTP_MAX_PORT: u16 = 9_999;
 
-const PLAIN_PAYLOAD_TYPE: u8 = 96;
+/// RTP payload type the PlainTransport Producer expects from Neko's
+/// `rtpvp8pay pt=96`. Exposed so edge-control can echo it back to dun-api
+/// → dun-app → the owner's GStreamer pipeline, keeping a single source of
+/// truth for the VP8 wire shape.
+pub const PLAIN_PAYLOAD_TYPE: u8 = 96;
 const PLAIN_CLOCK_RATE: u32 = 90_000;
-const PLAIN_SSRC: u32 = 22_222_222;
+/// Fixed RTP SSRC the Producer is bound to (Neko `udpsink ssrc=22222222`).
+pub const PLAIN_SSRC: u32 = 22_222_222;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RouterListenInfo {
