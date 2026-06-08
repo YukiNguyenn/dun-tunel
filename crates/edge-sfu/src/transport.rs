@@ -186,6 +186,16 @@ pub fn create_consumer_transport_options(listen: &RouterListenInfo) -> WebRtcTra
 /// RTP parameters of the producer fed by the gstreamer pipeline. Must
 /// match Neko's `rtpvp8pay pt=96` exactly — payload type, clock rate,
 /// fixed SSRC.
+///
+/// Codec contract (Data Model M2, single source of truth): VP8,
+/// `pt=96`, `ssrc=22222222`, `clockRate=90000`. The producer carries an
+/// EMPTY `rtcp_feedback` list — it MUST NEVER include
+/// `RtcpFeedback::Nack`. PlainTransport has no retransmit cache, so a
+/// negotiated Nack triggers an SRTP replay flood ("index too old") when
+/// the GStreamer pipeline resets sequence numbers on Neko reconnect (see
+/// `poc/neko-sfu/RESULTS.md`). The viewer-facing feedback (NackPli,
+/// CcmFir, GoogRemb, TransportCc) is declared on the router capability
+/// in `router_manager.rs`, not here on the PlainTransport producer.
 pub fn plain_producer_rtp_parameters() -> RtpParameters {
     RtpParameters {
         mid: None,
@@ -194,6 +204,7 @@ pub fn plain_producer_rtp_parameters() -> RtpParameters {
             payload_type: PLAIN_PAYLOAD_TYPE,
             clock_rate: NonZeroU32::new(PLAIN_CLOCK_RATE).unwrap(),
             parameters: RtpCodecParametersParameters::default(),
+            // No `RtcpFeedback::Nack` — Data Model M2 / RESULTS.md.
             rtcp_feedback: vec![],
         }],
         header_extensions: vec![],
@@ -210,6 +221,13 @@ pub fn plain_producer_rtp_parameters() -> RtpParameters {
 /// `rtpopuspay pt=111 ssrc=22222223` branch on the SAME PlainTransport.
 /// Stereo, 48 kHz, in-band FEC — mirrors Neko's own opus encode so the
 /// viewer hears the same audio as the host.
+///
+/// Codec contract (Data Model M2, single source of truth): Opus,
+/// `pt=111`, `ssrc=22222223`, `clockRate=48000`. Like the video
+/// producer, the `rtcp_feedback` list is EMPTY and MUST NEVER include
+/// `RtcpFeedback::Nack` on this PlainTransport-backed producer. The
+/// viewer-facing audio feedback (TransportCc) is declared on the router
+/// capability in `router_manager.rs`.
 pub fn plain_audio_producer_rtp_parameters() -> RtpParameters {
     RtpParameters {
         mid: None,
@@ -219,6 +237,7 @@ pub fn plain_audio_producer_rtp_parameters() -> RtpParameters {
             clock_rate: NonZeroU32::new(PLAIN_AUDIO_CLOCK_RATE).unwrap(),
             channels: NonZeroU8::new(2).unwrap(),
             parameters: RtpCodecParametersParameters::from([("useinbandfec", 1_u32.into())]),
+            // No `RtcpFeedback::Nack` — Data Model M2 / RESULTS.md.
             rtcp_feedback: vec![],
         }],
         header_extensions: vec![],
@@ -247,4 +266,110 @@ fn env_u16(name: &str, default: u16) -> anyhow::Result<u16> {
         })
         .transpose()
         .map(|opt| opt.unwrap_or(default))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Pull the payload type, clock rate, SSRC and rtcp_feedback out of a
+    /// single-codec producer `RtpParameters`. Returns `None` if the shape
+    /// ever deviates from the locked "one codec + one encoding" contract so
+    /// the property fails loudly instead of silently skipping the assert.
+    fn dissect(
+        params: &RtpParameters,
+    ) -> Option<(u8, u32, Option<u32>, Vec<RtcpFeedback>)> {
+        // Data Model M2: exactly one codec and one encoding on the producer.
+        if params.codecs.len() != 1 || params.encodings.len() != 1 {
+            return None;
+        }
+        let ssrc = params.encodings[0].ssrc;
+        match &params.codecs[0] {
+            RtpCodecParameters::Video {
+                payload_type,
+                clock_rate,
+                rtcp_feedback,
+                ..
+            }
+            | RtpCodecParameters::Audio {
+                payload_type,
+                clock_rate,
+                rtcp_feedback,
+                ..
+            } => Some((
+                *payload_type,
+                clock_rate.get(),
+                ssrc,
+                rtcp_feedback.clone(),
+            )),
+        }
+    }
+
+    proptest! {
+        /// Property 5: Codec lock-step (video).
+        ///
+        /// However many times we rebuild the params, the video producer
+        /// always carries `pt=96 ssrc=22222222 clockRate=90000` and an
+        /// `rtcp_feedback` list that never contains `RtcpFeedback::Nack`
+        /// (Data Model M2 — empty list on the PlainTransport producer).
+        ///
+        /// **Validates: Requirements 2.1, 2.2**
+        #[test]
+        fn video_producer_holds_codec_lock_step(_seed in any::<u64>()) {
+            let params = plain_producer_rtp_parameters();
+            let (pt, clock_rate, ssrc, rtcp_feedback) =
+                dissect(&params).expect("video producer must be single codec + single encoding");
+
+            prop_assert_eq!(pt, PLAIN_PAYLOAD_TYPE);
+            prop_assert_eq!(pt, 96);
+            prop_assert_eq!(clock_rate, PLAIN_CLOCK_RATE);
+            prop_assert_eq!(clock_rate, 90_000);
+            prop_assert_eq!(ssrc, Some(PLAIN_SSRC));
+            prop_assert_eq!(ssrc, Some(22_222_222));
+            // Never any Nack on the PlainTransport-backed producer.
+            prop_assert!(!rtcp_feedback.contains(&RtcpFeedback::Nack));
+            // M2: the producer feedback list is empty entirely.
+            prop_assert!(rtcp_feedback.is_empty());
+        }
+
+        /// Property 5: Codec lock-step (audio).
+        ///
+        /// The Opus producer always carries `pt=111 ssrc=22222223
+        /// clockRate=48000` and never negotiates `RtcpFeedback::Nack`.
+        ///
+        /// **Validates: Requirements 2.1, 2.2**
+        #[test]
+        fn audio_producer_holds_codec_lock_step(_seed in any::<u64>()) {
+            let params = plain_audio_producer_rtp_parameters();
+            let (pt, clock_rate, ssrc, rtcp_feedback) =
+                dissect(&params).expect("audio producer must be single codec + single encoding");
+
+            prop_assert_eq!(pt, PLAIN_AUDIO_PAYLOAD_TYPE);
+            prop_assert_eq!(pt, 111);
+            prop_assert_eq!(clock_rate, PLAIN_AUDIO_CLOCK_RATE);
+            prop_assert_eq!(clock_rate, 48_000);
+            prop_assert_eq!(ssrc, Some(PLAIN_AUDIO_SSRC));
+            prop_assert_eq!(ssrc, Some(22_222_223));
+            prop_assert!(!rtcp_feedback.contains(&RtcpFeedback::Nack));
+            prop_assert!(rtcp_feedback.is_empty());
+        }
+    }
+
+    /// Deterministic companion to the proptest: a plain assertion that the
+    /// two builders satisfy the M2 contract exactly once, so a regression is
+    /// obvious in a normal `cargo test` run even if proptest shrinking is
+    /// noisy.
+    #[test]
+    fn builders_match_data_model_m2() {
+        let (vpt, vclock, vssrc, vfb) =
+            dissect(&plain_producer_rtp_parameters()).expect("video shape");
+        assert_eq!((vpt, vclock, vssrc), (96, 90_000, Some(22_222_222)));
+        assert!(vfb.is_empty());
+
+        let (apt, aclock, assrc, afb) =
+            dissect(&plain_audio_producer_rtp_parameters()).expect("audio shape");
+        assert_eq!((apt, aclock, assrc), (111, 48_000, Some(22_222_223)));
+        assert!(afb.is_empty());
+    }
 }

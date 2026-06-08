@@ -26,6 +26,12 @@ thiserror.workspace = true
 dashmap.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
+# NekoInputBridge (C5) opens a Neko v3 admin WebSocket (Bearer auth) to
+# forward viewer input events. tokio-tungstenite is the client used
+# elsewhere in the codebase (see dun-app `state/websocket.rs`); rustls
+# matches the workspace TLS stack so the Neko URL may be ws:// or wss://.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 proptest.workspace = true

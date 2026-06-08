@@ -5,12 +5,16 @@
 //!
 //! See spec R8 + R23.2.
 
+pub mod input_envelope;
+pub mod neko_input_bridge;
 pub mod router_manager;
 pub mod snapshot_reporter;
 pub mod stats;
 pub mod transport;
 pub mod viewer_cap;
 
+pub use input_envelope::InputEnvelope;
+pub use neko_input_bridge::NekoInputBridge;
 pub use router_manager::{
     ConsumedInfo, ConsumerTransportInfo, ProvisionedRouter, RouterManager, SessionState,
     ViewerSlot,
@@ -30,8 +34,9 @@ pub use transport::{RouterListenInfo, PLAIN_PAYLOAD_TYPE, PLAIN_SSRC};
 /// viewer code.
 pub use mediasoup::prelude::{
     ConsumerId, DtlsParameters, IceCandidate, IceParameters, ProducerId,
-    RtpCapabilities, RtpCapabilitiesFinalized, TransportId,
+    RtpCapabilities, RtpCapabilitiesFinalized, SctpStreamParameters, TransportId,
 };
+pub use mediasoup::data_producer::{DataProducerId, DataProducerOptions};
 
 /// Maximum viewers per session (R8.8 — flat cap 30).
 pub const VIEWER_CAP_PER_SESSION: u32 = 30;

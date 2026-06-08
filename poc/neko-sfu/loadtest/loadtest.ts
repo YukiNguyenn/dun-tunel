@@ -138,14 +138,14 @@ async function spawnViewer(
     // Wait until the <video> element gets a track that emits "unmute".
     // We expose it via window.__firstFrameMs in the page context, set by main.ts
     // when consumer.track receives 'unmute'. We poll for it.
-    const firstFrameMs = await page.waitForFunction<number>(
+    const firstFrameMs = (await page.waitForFunction(
       () => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const w = window as unknown as { __firstFrameMs?: number };
         return typeof w.__firstFrameMs === "number" ? w.__firstFrameMs : false;
       },
       { timeout: FIRST_FRAME_TIMEOUT_MS, polling: 100 },
-    ).then((handle) => handle.jsonValue());
+    ).then((handle) => handle.jsonValue())) as number;
     result.firstFrameMs = firstFrameMs;
     log(`viewer ${viewerId} first frame at ${firstFrameMs}ms`);
 

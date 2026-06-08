@@ -1,3 +1,4 @@
 node_modules/
 loadtest-results.json
+loadtest-input-results.json
 package-lock.json

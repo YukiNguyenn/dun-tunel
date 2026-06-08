@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsx loadtest.ts"
+    "test": "tsx loadtest.ts",
+    "test:input": "tsx loadtest-input.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "playwright": "1.48.2"
