@@ -47,6 +47,12 @@ services:
       # browser + owner's udpsink target — NOT the private NAT address.
       SFU_ANNOUNCED_IP: ${SFU_ANNOUNCED_IP:?SFU_ANNOUNCED_IP required (edge public IPv4)}
       SFU_LISTEN_IP: ${SFU_LISTEN_IP:-0.0.0.0}
+      # Optional LAN candidate for same-network (hairpin) testing. When the
+      # viewer/owner shares the same public IP as this VPS (same LAN), set
+      # this to the edge's private IP (e.g. 192.168.20.6) so viewers get an
+      # extra host ICE candidate that bypasses the public hairpin. Leave
+      # EMPTY/unset in production — public IP only.
+      SFU_ANNOUNCED_IP_LAN: ${SFU_ANNOUNCED_IP_LAN:-}
       # Plain RTP/RTCP producer-ingest pool (owner → SFU). 50000-50099.
       SFU_PLAIN_RTP_MIN_PORT: ${SFU_PLAIN_RTP_MIN_PORT:-50000}
       SFU_PLAIN_RTP_MAX_PORT: ${SFU_PLAIN_RTP_MAX_PORT:-50099}
