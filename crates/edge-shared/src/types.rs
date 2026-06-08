@@ -57,6 +57,13 @@ pub struct CreateSessionResp {
     /// Fixed RTP SSRC the SFU Producer is bound to (matches Neko udpsink).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_ssrc: Option<u32>,
+    /// Optional LAN-private host for same-network (hairpin) operation.
+    /// Mirrors edge `SFU_ANNOUNCED_IP_LAN`. When set, an owner whose
+    /// public IP equals the edge's public IP can target this private IP
+    /// directly for the udpsink ingest leg instead of hairpinning off
+    /// the public host. `None` in production (no LAN candidate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_lan_host: Option<String>,
 }
 
 /// State snapshot endpoint cho reconciliation job (R22).

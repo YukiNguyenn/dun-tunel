@@ -148,6 +148,9 @@ pub async fn create(
         media_rtp_port: Some(provisioned.plain_rtp_port),
         media_payload_type: Some(edge_sfu::PLAIN_PAYLOAD_TYPE),
         media_ssrc: Some(edge_sfu::PLAIN_SSRC),
+        // Optional LAN-private host for same-network (hairpin) testing,
+        // sourced from `SFU_ANNOUNCED_IP_LAN`. `None` in production.
+        media_lan_host: state.sfu.media_lan_host(),
     }))
 }
 

@@ -151,6 +151,15 @@ impl RouterManager {
         }
     }
 
+    /// Optional LAN-private host advertised for same-network (hairpin)
+    /// operation, sourced from `SFU_ANNOUNCED_IP_LAN`. `None` in
+    /// production. edge-control echoes this into `CreateSessionResp` so
+    /// dun-app can route the owner's udpsink to the private IP when the
+    /// owner shares the edge's public IP.
+    pub fn media_lan_host(&self) -> Option<String> {
+        self.inner.listen.lan_announced_ip.map(|ip| ip.to_string())
+    }
+
     /// Create a Router + PlainTransport (comedia mode) + Producer for a new
     /// session. Idempotent: re-calling with the same `session_id` returns the
     /// existing handle.
