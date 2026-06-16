@@ -226,6 +226,17 @@ enum ClientMessage {
     Consume { producer_id: ProducerId },
     #[serde(rename_all = "camelCase")]
     ConsumerResume { id: ConsumerId },
+    // ── Quality control (Hướng 2) ──────────────────────────────────────
+    // The viewer picks a preferred VP8 temporal layer (framerate tier) for
+    // its video consumer, or `temporalLayer: null` to hand control back to
+    // mediasoup's per-consumer bandwidth estimator (auto). `spatialLayer`
+    // is always 0 (the source is single-spatial-layer L1T3).
+    #[serde(rename_all = "camelCase")]
+    SetPreferredLayers {
+        id: ConsumerId,
+        spatial_layer: u8,
+        temporal_layer: Option<u8>,
+    },
     // ── Input path (task 7.2) ──────────────────────────────────────────
     // The viewer authors the `neko-input` DataChannel on its send
     // transport. `ConnectInputTransport` DTLS-connects that transport and
@@ -454,6 +465,32 @@ async fn run_session(
                         "resume_consumer failed"
                     );
                     send_error(&mut socket, "consumer_resume_failed").await?;
+                }
+            }
+            ClientMessage::SetPreferredLayers {
+                id,
+                spatial_layer,
+                temporal_layer,
+            } => {
+                // Best-effort: a failure here leaves the consumer at its
+                // current layer and must NOT drop the connection — the
+                // video keeps playing. We log + send a non-terminal Error
+                // the viewer can surface as "quality change failed".
+                if let Err(err) = sfu
+                    .set_preferred_layers(
+                        &session_id,
+                        &viewer_id,
+                        id,
+                        spatial_layer,
+                        temporal_layer,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        %session_id, %viewer_id, consumer_id = %id, error = %err,
+                        "set_preferred_layers failed"
+                    );
+                    send_error(&mut socket, "set_preferred_layers_failed").await?;
                 }
             }
             // ── Input handshake (task 7.2) ──────────────────────────────

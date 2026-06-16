@@ -210,6 +210,19 @@ pub fn plain_producer_rtp_parameters() -> RtpParameters {
         header_extensions: vec![],
         encodings: vec![RtpEncodingParameters {
             ssrc: Some(PLAIN_SSRC),
+            // The GStreamer `vp8enc temporal-scalability-number-layers=3`
+            // branch emits an L1T3 hierarchy (1 spatial, 3 temporal
+            // layers) on this single SSRC. Declaring the matching
+            // `scalabilityMode` here tells mediasoup to parse the VP8
+            // payload descriptor for the temporal-layer id so it can
+            // forward a subset of layers per consumer (framerate
+            // adaptation). Without it mediasoup treats the stream as
+            // L1T1 and `set_preferred_layers` temporal control is a
+            // no-op. `parse()` is infallible for a hard-coded valid
+            // mode; `expect` documents the invariant.
+            scalability_mode: "L1T3"
+                .parse()
+                .expect("L1T3 is a valid scalability mode"),
             ..RtpEncodingParameters::default()
         }],
         rtcp: RtcpParameters::default(),

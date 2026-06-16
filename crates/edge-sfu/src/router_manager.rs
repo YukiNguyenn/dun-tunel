@@ -26,6 +26,7 @@ use anyhow::Context;
 use dashmap::DashMap;
 use edge_shared::types::SessionId;
 use mediasoup::consumer::ConsumerId;
+use mediasoup::consumer::ConsumerLayers;
 use mediasoup::data_producer::DataProducerId;
 use mediasoup::prelude::*;
 use mediasoup::producer::ProducerId;
@@ -795,6 +796,56 @@ impl RouterManager {
                 .ok_or_else(|| anyhow::anyhow!("consumer not found"))?
         };
         consumer.resume().await.context("resume consumer")?;
+        Ok(())
+    }
+
+    /// Set the preferred spatial/temporal layers for a viewer's video
+    /// consumer (quality control, Hướng 2). The GStreamer source encodes
+    /// VP8 L1T3 (one spatial layer, three temporal layers), so:
+    ///   - `spatial_layer` is always 0 (single spatial layer).
+    ///   - `temporal_layer = Some(0|1|2)` pins a framerate tier
+    ///     (~7.5 / 15 / 30 fps).
+    ///   - `temporal_layer = None` hands control back to mediasoup's
+    ///     per-consumer bandwidth estimator (the "auto" mode): it sends
+    ///     the highest tier the viewer's link sustains and steps down on
+    ///     congestion — YouTube-style auto-degrade, per viewer.
+    ///
+    /// Idempotent and best-effort: an unknown session/viewer/consumer is
+    /// an error the WS handler logs but does not treat as fatal (the
+    /// video keeps playing at whatever layer was already selected).
+    pub async fn set_preferred_layers(
+        &self,
+        session_id: &str,
+        viewer_id: &str,
+        consumer_id: ConsumerId,
+        spatial_layer: u8,
+        temporal_layer: Option<u8>,
+    ) -> anyhow::Result<()> {
+        let consumer = {
+            let state = self
+                .inner
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?
+                .clone();
+            let guard = state.lock().await;
+            let slot = guard
+                .viewers
+                .get(viewer_id)
+                .ok_or_else(|| anyhow::anyhow!("viewer not found"))?;
+            slot.consumers
+                .iter()
+                .find(|c| c.id() == consumer_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("consumer not found"))?
+        };
+        consumer
+            .set_preferred_layers(ConsumerLayers {
+                spatial_layer,
+                temporal_layer,
+            })
+            .await
+            .context("set preferred layers")?;
         Ok(())
     }
 
