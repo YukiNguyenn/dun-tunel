@@ -56,10 +56,18 @@ services:
       # Plain RTP/RTCP producer-ingest pool (owner → SFU). 50000-50099.
       SFU_PLAIN_RTP_MIN_PORT: ${SFU_PLAIN_RTP_MIN_PORT:-50000}
       SFU_PLAIN_RTP_MAX_PORT: ${SFU_PLAIN_RTP_MAX_PORT:-50099}
-      # Viewer WebRtcTransport pool (SFU → viewers). 50100-59999 = ~5000
-      # ports ≈ 2500 concurrent viewers (2 transports each).
+      # Viewer WebRtcTransport pool (SFU → viewers). With the WebRtcServer
+      # UDP-mux model, each worker binds ONE port = SFU_RTC_MIN_PORT +
+      # worker_index. So the open/forwarded UDP range is
+      # `SFU_RTC_MIN_PORT .. SFU_RTC_MIN_PORT + SFU_WORKERS - 1`.
+      # SFU_RTC_MAX_PORT is now only a sanity bound (min < max).
       SFU_RTC_MIN_PORT: ${SFU_RTC_MIN_PORT:-50100}
       SFU_RTC_MAX_PORT: ${SFU_RTC_MAX_PORT:-59999}
+      # mediasoup worker count = number of UDP mux ports to forward. Keep
+      # small so only a few ports need NAT port-forwarding. Defaults to 1
+      # (single mux port = SFU_RTC_MIN_PORT). Was previously unset →
+      # defaulted to num_cpus, spawning one mux port per core.
+      SFU_WORKERS: ${SFU_WORKERS:-1}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       # Read-write: bridge rewrite rathole config + persist sequence
