@@ -19,7 +19,8 @@ use crate::input_envelope::InputEnvelope;
 use crate::neko_input_bridge::NekoInputBridge;
 use crate::transport::{
     create_consumer_transport_options, create_plain_transport_options,
-    plain_audio_producer_rtp_parameters, plain_producer_rtp_parameters, RouterListenInfo,
+    create_plain_transport_options_on_port, plain_audio_producer_rtp_parameters,
+    plain_producer_rtp_parameters, RouterListenInfo,
 };
 use crate::VIEWER_CAP_PER_SESSION;
 use anyhow::Context;
@@ -39,7 +40,26 @@ use std::env;
 use std::num::{NonZeroU32, NonZeroU8};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/// How often the source monitor samples each session's producer.
+const SOURCE_MONITOR_SECS: u64 = 5;
+/// A producer that was receiving RTP but goes silent this long (with
+/// viewers present) is treated as a restarted source → reprovision to
+/// re-lock comedia. Generous enough not to fire on a brief owner network
+/// blip (where RTP resumes from the SAME tuple and needs no reprovision).
+const SOURCE_STARVE_SECS: u64 = 12;
+
+/// Per-session RTP-activity tracking used by the source monitor.
+struct ProducerActivity {
+    last_bytes: u64,
+    last_change: Instant,
+    /// Whether the producer has EVER received RTP. We only reprovision a
+    /// producer that was flowing and then stopped — never one that has
+    /// not started yet (fresh session, owner broadcast not up).
+    ever_flowed: bool,
+}
 
 /// Phase 2: per-session state owned by the SFU.
 pub struct SessionState {
@@ -157,14 +177,21 @@ impl RouterManager {
                 .context("create mediasoup worker")?;
             pool.push(worker);
         }
-        Ok(Self {
+        let manager = Self {
             inner: Arc::new(RouterManagerInner {
                 workers: pool,
                 worker_cursor: AtomicUsize::new(0),
                 sessions: DashMap::new(),
                 listen,
             }),
-        })
+        };
+        // Self-healing: watch every session's plain producer and re-lock
+        // comedia onto a new source tuple when the RTP source restarts
+        // (e.g. owner restarts the container → new Docker SNAT source port
+        // → comedia drops everything from the new tuple). See
+        // `run_source_monitor`.
+        manager.spawn_source_monitor();
+        Ok(manager)
     }
 
     /// Backward-compat shim used by `edge-control::AppState::initialize`
@@ -853,6 +880,182 @@ impl RouterManager {
         let idx = self.inner.worker_cursor.fetch_add(1, Ordering::Relaxed)
             % self.inner.workers.len();
         &self.inner.workers[idx]
+    }
+
+    /// Read `(has_viewers, video_producer_byte_count)` for a session, or
+    /// `None` if the session/producer is gone. Used by the source
+    /// monitor to detect a starved producer.
+    async fn producer_activity(&self, session_id: &str) -> Option<(bool, u64)> {
+        let state = self.inner.sessions.get(session_id)?.clone();
+        let guard = state.lock().await;
+        let has_viewers = !guard.viewers.is_empty();
+        let producer = guard.plain_producer.as_ref()?;
+        let stats = producer.get_stats().await.ok()?;
+        let bytes = stats.iter().map(|s| s.byte_count).max().unwrap_or(0);
+        Some((has_viewers, bytes))
+    }
+
+    /// Tear down and recreate the session's PlainTransport + video/audio
+    /// producers, REUSING THE SAME UDP PORT so the owner's udpsink keeps
+    /// hitting a valid destination. This re-locks comedia onto the new
+    /// source tuple after the RTP source restarts.
+    ///
+    /// The new producers get fresh ids; existing viewer consumers of the
+    /// old producers are closed when the old producer drops. Viewers
+    /// recover on their next reconnect — the WS `Init` reports the new
+    /// `producerId` and they consume it. Best-effort; logs on failure.
+    pub async fn reprovision_plain_producer(&self, session_id: &str) -> anyhow::Result<()> {
+        let state = self
+            .inner
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found"))?
+            .clone();
+        let mut guard = state.lock().await;
+        let router = guard.router.clone();
+        // Reuse the old local port so the owner's udpsink target is unchanged.
+        let old_port = guard
+            ._plain_transport
+            .as_ref()
+            .map(|t| t.tuple().local_port());
+
+        // Drop old producers + transport first → closes them on the worker
+        // and frees the UDP port for rebinding.
+        guard.plain_producer = None;
+        guard.plain_audio_producer = None;
+        guard._plain_transport = None;
+
+        // Recreate on the same port. The worker frees the port
+        // asynchronously after the drop above, so retry a few times.
+        let mut plain_transport = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..12u32 {
+            let opts = match old_port {
+                Some(p) => create_plain_transport_options_on_port(&self.inner.listen, p),
+                None => create_plain_transport_options(&self.inner.listen),
+            };
+            match router.create_plain_transport(opts).await {
+                Ok(t) => {
+                    plain_transport = Some(t);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!(e.to_string()));
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
+        let plain_transport = plain_transport.ok_or_else(|| {
+            anyhow::anyhow!(
+                "recreate plain transport on port {:?} failed: {:?}",
+                old_port,
+                last_err
+            )
+        })?;
+
+        let producer = plain_transport
+            .produce(ProducerOptions::new(
+                MediaKind::Video,
+                plain_producer_rtp_parameters(),
+            ))
+            .await
+            .context("re-produce video")?;
+        let audio_producer = plain_transport
+            .produce(ProducerOptions::new(
+                MediaKind::Audio,
+                plain_audio_producer_rtp_parameters(),
+            ))
+            .await
+            .context("re-produce audio")?;
+
+        let new_port = plain_transport.tuple().local_port();
+        let new_producer_id = producer.id();
+        guard._plain_transport = Some(plain_transport);
+        guard.plain_producer = Some(producer);
+        guard.plain_audio_producer = Some(audio_producer);
+        tracing::info!(
+            %session_id,
+            old_port = ?old_port,
+            new_port,
+            %new_producer_id,
+            "plain producer reprovisioned — comedia will re-lock onto the new source tuple"
+        );
+        Ok(())
+    }
+
+    /// Spawn the per-process source monitor. It periodically samples each
+    /// session's plain video producer; if a producer that was previously
+    /// receiving RTP goes silent for [`SOURCE_STARVE_SECS`] while viewers
+    /// are present, it reprovisions the producer to re-lock comedia (the
+    /// container-restart recovery path). Holds a strong handle, so it runs
+    /// for the process lifetime (the manager lives in `AppState`).
+    fn spawn_source_monitor(&self) {
+        let manager = self.clone_handle();
+        tokio::spawn(async move {
+            let mut activity: HashMap<SessionId, ProducerActivity> = HashMap::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(SOURCE_MONITOR_SECS));
+            loop {
+                ticker.tick().await;
+                let session_ids: Vec<SessionId> = manager
+                    .inner
+                    .sessions
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                // Forget tracking for sessions that no longer exist.
+                activity.retain(|sid, _| manager.inner.sessions.contains_key(sid));
+
+                for sid in session_ids {
+                    let Some((has_viewers, bytes)) = manager.producer_activity(&sid).await else {
+                        activity.remove(&sid);
+                        continue;
+                    };
+                    if !has_viewers {
+                        // No one watching → broadcast may be intentionally
+                        // stopped. Don't reprovision; reset tracking.
+                        activity.remove(&sid);
+                        continue;
+                    }
+                    let now = Instant::now();
+                    let entry = activity.entry(sid.clone()).or_insert(ProducerActivity {
+                        last_bytes: bytes,
+                        last_change: now,
+                        ever_flowed: bytes > 0,
+                    });
+                    if bytes > entry.last_bytes {
+                        entry.last_bytes = bytes;
+                        entry.last_change = now;
+                        entry.ever_flowed = true;
+                    } else if entry.ever_flowed
+                        && now.duration_since(entry.last_change)
+                            >= Duration::from_secs(SOURCE_STARVE_SECS)
+                    {
+                        tracing::warn!(
+                            session_id = %sid,
+                            starve_secs = SOURCE_STARVE_SECS,
+                            "plain producer starved with viewers present — reprovisioning to re-lock comedia"
+                        );
+                        match manager.reprovision_plain_producer(&sid).await {
+                            Ok(()) => {
+                                // Fresh producer: wait for it to flow again
+                                // before considering another reprovision, so
+                                // a still-dead source doesn't churn.
+                                *entry = ProducerActivity {
+                                    last_bytes: 0,
+                                    last_change: Instant::now(),
+                                    ever_flowed: false,
+                                };
+                            }
+                            Err(e) => {
+                                tracing::error!(session_id = %sid, error = %e, "reprovision failed");
+                                // Back off this session for a cycle.
+                                entry.last_change = Instant::now();
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 

@@ -140,7 +140,33 @@ pub fn create_plain_transport_options(listen: &RouterListenInfo) -> PlainTranspo
     opts
 }
 
-/// Build WebRtcTransport options for a viewer Consumer/Producer pair.
+/// Like [`create_plain_transport_options`] but pins the UDP port to
+/// `port` instead of picking from the range. Used when RE-creating a
+/// session's PlainTransport after the RTP source restarts: comedia locks
+/// onto the first packet's source tuple and then drops packets from any
+/// other tuple (mediasoup `PlainTransport.cpp`: "ignoring RTP packet from
+/// unknown IP:port"), so a container restart (new Docker SNAT source
+/// port) starves the producer forever. Recreating the transport re-locks
+/// comedia onto the new source — and reusing the SAME local port means
+/// the owner's udpsink target stays valid (no owner-side change needed).
+pub fn create_plain_transport_options_on_port(
+    listen: &RouterListenInfo,
+    port: u16,
+) -> PlainTransportOptions {
+    let mut opts = PlainTransportOptions::new(ListenInfo {
+        protocol: Protocol::Udp,
+        ip: listen.listen_ip,
+        announced_address: Some(listen.announced_ip.to_string()),
+        expose_internal_ip: false,
+        port: Some(port),
+        port_range: None,
+        flags: None,
+        send_buffer_size: None,
+        recv_buffer_size: None,
+    });
+    opts.comedia = true;
+    opts
+}
 /// SCTP enabled so the viewer can author the `neko-input` DataChannel.
 pub fn create_consumer_transport_options(listen: &RouterListenInfo) -> WebRtcTransportOptions {
     let mut listen_infos = WebRtcTransportListenInfos::new(ListenInfo {
