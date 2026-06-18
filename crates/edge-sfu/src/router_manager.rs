@@ -388,6 +388,19 @@ impl RouterManager {
             .await
             .context("create send transport")?;
 
+        // Diagnostic: log the ICE candidates advertised to the viewer for
+        // the media (recv) transport. The viewer's browser must be able to
+        // reach this exact IP:port over UDP. If the address is a private
+        // IP (e.g. 192.168.x) an external viewer can never connect →
+        // 0 kbps; if it's the public IP, the NAT/firewall must forward
+        // that UDP port to the edge host.
+        tracing::info!(
+            session_id = %session_id,
+            viewer_id = %viewer_id,
+            recv_candidates = ?recv.ice_candidates(),
+            "viewer transport ICE candidates (media path)"
+        );
+
         let recv_info = ConsumerTransportInfo {
             viewer_id: viewer_id.to_string(),
             transport_id: recv.id(),
