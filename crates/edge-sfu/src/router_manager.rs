@@ -59,6 +59,24 @@ struct ProducerActivity {
     /// producer that was flowing and then stopped — never one that has
     /// not started yet (fresh session, owner broadcast not up).
     ever_flowed: bool,
+    /// Cumulative `packets_lost` at the previous sample, to log the
+    /// per-interval delta (owner→edge loss).
+    last_packets_lost: u64,
+}
+
+/// One sample of the plain video producer's inbound RTP health
+/// (the owner→edge leg). Lets the monitor both detect starvation
+/// (`byte_count`) and log loss so we can localise stutter (compare
+/// against the viewer-side edge→viewer loss the client logs).
+struct ProducerSample {
+    has_viewers: bool,
+    byte_count: u64,
+    packets_lost: u64,
+    /// RTCP fraction lost (0-255 ≈ 0-100%) over the last interval.
+    fraction_lost: u8,
+    /// Producer transmission quality score (0-10).
+    score: u8,
+    bitrate: u32,
 }
 
 /// Phase 2: per-session state owned by the SFU.
@@ -882,17 +900,36 @@ impl RouterManager {
         &self.inner.workers[idx]
     }
 
-    /// Read `(has_viewers, video_producer_byte_count)` for a session, or
-    /// `None` if the session/producer is gone. Used by the source
-    /// monitor to detect a starved producer.
-    async fn producer_activity(&self, session_id: &str) -> Option<(bool, u64)> {
+    /// Sample the plain video producer's inbound RTP health for a
+    /// session (owner→edge leg), or `None` if the session/producer is
+    /// gone. Used by the source monitor for both starvation detection
+    /// (`byte_count`) and per-leg loss logging.
+    async fn producer_sample(&self, session_id: &str) -> Option<ProducerSample> {
         let state = self.inner.sessions.get(session_id)?.clone();
         let guard = state.lock().await;
         let has_viewers = !guard.viewers.is_empty();
         let producer = guard.plain_producer.as_ref()?;
         let stats = producer.get_stats().await.ok()?;
-        let bytes = stats.iter().map(|s| s.byte_count).max().unwrap_or(0);
-        Some((has_viewers, bytes))
+        // The plain video producer has exactly one RtpStreamRecv; pick the
+        // richest stat (max byte_count). Empty before the first RTP packet.
+        match stats.into_iter().max_by_key(|s| s.byte_count) {
+            Some(s) => Some(ProducerSample {
+                has_viewers,
+                byte_count: s.byte_count,
+                packets_lost: s.packets_lost,
+                fraction_lost: s.fraction_lost,
+                score: s.score,
+                bitrate: s.bitrate,
+            }),
+            None => Some(ProducerSample {
+                has_viewers,
+                byte_count: 0,
+                packets_lost: 0,
+                fraction_lost: 0,
+                score: 0,
+                bitrate: 0,
+            }),
+        }
     }
 
     /// Tear down and recreate the session's PlainTransport + video/audio
@@ -1006,22 +1043,44 @@ impl RouterManager {
                 activity.retain(|sid, _| manager.inner.sessions.contains_key(sid));
 
                 for sid in session_ids {
-                    let Some((has_viewers, bytes)) = manager.producer_activity(&sid).await else {
+                    let Some(sample) = manager.producer_sample(&sid).await else {
                         activity.remove(&sid);
                         continue;
                     };
-                    if !has_viewers {
+                    if !sample.has_viewers {
                         // No one watching → broadcast may be intentionally
                         // stopped. Don't reprovision; reset tracking.
                         activity.remove(&sid);
                         continue;
                     }
+                    let bytes = sample.byte_count;
                     let now = Instant::now();
                     let entry = activity.entry(sid.clone()).or_insert(ProducerActivity {
                         last_bytes: bytes,
                         last_change: now,
                         ever_flowed: bytes > 0,
+                        last_packets_lost: sample.packets_lost,
                     });
+
+                    // ── Per-leg loss log (owner→edge) ─────────────────────
+                    // Compare this against the viewer's edge→viewer `[net]`
+                    // loss (logged client-side) to localise where stutter
+                    // originates: high here = lossy owner→edge UDP leg (no
+                    // NACK, hits all viewers); low here but high at viewer =
+                    // lossy edge→viewer internet path.
+                    let lost_delta = sample.packets_lost.saturating_sub(entry.last_packets_lost);
+                    entry.last_packets_lost = sample.packets_lost;
+                    tracing::info!(
+                        session_id = %sid,
+                        leg = "owner->edge",
+                        bitrate_kbps = sample.bitrate / 1000,
+                        fraction_lost_pct = (sample.fraction_lost as f32) / 255.0 * 100.0,
+                        packets_lost_total = sample.packets_lost,
+                        packets_lost_delta = lost_delta,
+                        score = sample.score,
+                        "producer RTP health"
+                    );
+
                     if bytes > entry.last_bytes {
                         entry.last_bytes = bytes;
                         entry.last_change = now;
@@ -1044,6 +1103,7 @@ impl RouterManager {
                                     last_bytes: 0,
                                     last_change: Instant::now(),
                                     ever_flowed: false,
+                                    last_packets_lost: 0,
                                 };
                             }
                             Err(e) => {
