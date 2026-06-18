@@ -18,9 +18,9 @@
 use crate::input_envelope::InputEnvelope;
 use crate::neko_input_bridge::NekoInputBridge;
 use crate::transport::{
-    create_consumer_transport_options, create_plain_transport_options,
-    create_plain_transport_options_on_port, plain_audio_producer_rtp_parameters,
-    plain_producer_rtp_parameters, RouterListenInfo,
+    create_consumer_transport_options_with_server, create_plain_transport_options,
+    create_plain_transport_options_on_port, create_webrtc_server_options,
+    plain_audio_producer_rtp_parameters, plain_producer_rtp_parameters, RouterListenInfo,
 };
 use crate::VIEWER_CAP_PER_SESSION;
 use anyhow::Context;
@@ -106,6 +106,12 @@ pub struct SessionState {
     /// task 4.1); referenced here by full path so this field compiles once
     /// that module is exported. Do not redefine the type here.
     pub input_bridge: Option<Arc<crate::neko_input_bridge::NekoInputBridge>>,
+    /// The per-worker [`WebRtcServer`] (single UDP mux port) this session's
+    /// router lives on. All viewer transports for the session are created
+    /// against it so they share one UDP port. Cloned from
+    /// `RouterManagerInner::webrtc_servers` at provision time (matched to
+    /// the worker the router was created on).
+    pub webrtc_server: WebRtcServer,
     /// Cumulative bytes received by all viewer transports (for bandwidth
     /// reporting). Sampled by `get_session_bytes`.
     pub _cumulative_bytes_cache: Mutex<u64>,
@@ -169,6 +175,11 @@ pub struct RouterManager {
 
 struct RouterManagerInner {
     workers: Vec<Worker>,
+    /// One `WebRtcServer` per worker (aligned by index with `workers`),
+    /// each bound to a single UDP port `rtc_min_port + worker_index`. A
+    /// session's viewer transports use the server of the worker its router
+    /// was created on — see `provision_session`.
+    webrtc_servers: Vec<WebRtcServer>,
     /// Round-robin index for picking the next worker on session create.
     worker_cursor: AtomicUsize,
     sessions: DashMap<SessionId, Arc<Mutex<SessionState>>>,
@@ -186,18 +197,32 @@ impl RouterManager {
         }
         let manager = WorkerManager::new();
         let mut pool = Vec::with_capacity(workers);
-        for _ in 0..workers {
+        let mut servers = Vec::with_capacity(workers);
+        for idx in 0..workers {
             let mut settings = WorkerSettings::default();
             settings.log_level = mediasoup::worker::WorkerLogLevel::Warn;
             let worker = manager
                 .create_worker(settings)
                 .await
                 .context("create mediasoup worker")?;
+            // One WebRtcServer per worker on a single UDP mux port. Workers
+            // are separate processes and cannot share a port, so each takes
+            // `rtc_min_port + idx`. Open `rtc_min_port .. rtc_min_port +
+            // workers - 1` (UDP) on the edge firewall — far fewer than the
+            // old per-transport range.
+            let port = listen.rtc_min_port + idx as u16;
+            let server = worker
+                .create_webrtc_server(create_webrtc_server_options(&listen, port))
+                .await
+                .context("create webrtc server")?;
+            tracing::info!(worker_index = idx, mux_port = port, "webrtc server (udp mux) ready");
             pool.push(worker);
+            servers.push(server);
         }
         let manager = Self {
             inner: Arc::new(RouterManagerInner {
                 workers: pool,
+                webrtc_servers: servers,
                 worker_cursor: AtomicUsize::new(0),
                 sessions: DashMap::new(),
                 listen,
@@ -245,7 +270,9 @@ impl RouterManager {
             return Ok(snapshot(&guard));
         }
 
-        let worker = self.pick_worker();
+        let worker_index = self.pick_worker_index();
+        let worker = &self.inner.workers[worker_index];
+        let webrtc_server = self.inner.webrtc_servers[worker_index].clone();
         let media_codecs = default_media_codecs();
         let router = worker
             .create_router(RouterOptions::new(media_codecs))
@@ -300,6 +327,7 @@ impl RouterManager {
             viewers: HashMap::new(),
             direct_transport: None,
             input_bridge: None,
+            webrtc_server,
             _cumulative_bytes_cache: Mutex::new(0),
         };
         self.inner
@@ -346,8 +374,9 @@ impl RouterManager {
             anyhow::bail!("viewer cap reached");
         }
 
-        let recv_options = create_consumer_transport_options(&self.inner.listen);
-        let send_options = create_consumer_transport_options(&self.inner.listen);
+        let server = guard.webrtc_server.clone();
+        let recv_options = create_consumer_transport_options_with_server(server.clone());
+        let send_options = create_consumer_transport_options_with_server(server);
         let recv = guard
             .router
             .create_webrtc_transport(recv_options)
@@ -894,10 +923,8 @@ impl RouterManager {
         Ok(())
     }
 
-    fn pick_worker(&self) -> &Worker {
-        let idx = self.inner.worker_cursor.fetch_add(1, Ordering::Relaxed)
-            % self.inner.workers.len();
-        &self.inner.workers[idx]
+    fn pick_worker_index(&self) -> usize {
+        self.inner.worker_cursor.fetch_add(1, Ordering::Relaxed) % self.inner.workers.len()
     }
 
     /// Sample the plain video producer's inbound RTP health for a

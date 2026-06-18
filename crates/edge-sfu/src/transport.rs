@@ -167,43 +167,43 @@ pub fn create_plain_transport_options_on_port(
     opts.comedia = true;
     opts
 }
-/// SCTP enabled so the viewer can author the `neko-input` DataChannel.
-pub fn create_consumer_transport_options(listen: &RouterListenInfo) -> WebRtcTransportOptions {
-    let mut listen_infos = WebRtcTransportListenInfos::new(ListenInfo {
+/// Build the per-worker [`WebRtcServer`] options bound to a SINGLE UDP
+/// port (`port`). Every viewer `WebRtcTransport` created against this
+/// server multiplexes onto that one port (mediasoup is ICE-Lite and
+/// demuxes peers by ICE ufrag), so the edge firewall only needs ONE UDP
+/// port per worker open instead of the whole `rtc_min..rtc_max` range —
+/// the symmetric counterpart to Neko's `NEKO_WEBRTC_UDPMUX` on the owner
+/// side.
+///
+/// NOTE: a `WebRtcServer` binds one socket per listen info, and binding
+/// `0.0.0.0:port` twice collides (`EADDRINUSE`). The optional
+/// `SFU_ANNOUNCED_IP_LAN` hairpin candidate therefore CANNOT share the
+/// same fixed port, so it is intentionally NOT advertised here — viewers
+/// are remote (public `announced_ip`) in production. The owner-side
+/// udpsink still uses the LAN host via `media_lan_host()` on the separate
+/// PlainTransport, which is unaffected.
+pub fn create_webrtc_server_options(listen: &RouterListenInfo, port: u16) -> WebRtcServerOptions {
+    let infos = WebRtcServerListenInfos::new(ListenInfo {
         protocol: Protocol::Udp,
         ip: listen.listen_ip,
         announced_address: Some(listen.announced_ip.to_string()),
         expose_internal_ip: false,
-        port: None,
-        port_range: Some(listen.rtc_min_port..=listen.rtc_max_port),
+        port: Some(port),
+        port_range: None,
         flags: None,
         send_buffer_size: None,
         recv_buffer_size: None,
     });
+    WebRtcServerOptions::new(infos)
+}
 
-    // Optional second ICE candidate for same-LAN (hairpin) testing.
-    // When `SFU_ANNOUNCED_IP_LAN` is set, advertise the edge's private
-    // IP as an additional host candidate so a viewer on the same LAN can
-    // connect directly instead of hairpinning off the public IP. The
-    // browser's ICE agent picks whichever candidate pair works (public
-    // for remote viewers, private for same-LAN), so this is safe to send
-    // to everyone — remote viewers simply fail the private pair and fall
-    // back to the public one. Unset in production.
-    if let Some(lan_ip) = listen.lan_announced_ip {
-        listen_infos = listen_infos.insert(ListenInfo {
-            protocol: Protocol::Udp,
-            ip: listen.listen_ip,
-            announced_address: Some(lan_ip.to_string()),
-            expose_internal_ip: false,
-            port: None,
-            port_range: Some(listen.rtc_min_port..=listen.rtc_max_port),
-            flags: None,
-            send_buffer_size: None,
-            recv_buffer_size: None,
-        });
-    }
-
-    let mut opts = WebRtcTransportOptions::new(listen_infos);
+/// Build viewer transport options bound to a shared [`WebRtcServer`]
+/// (single UDP mux port) instead of a per-transport port range. SCTP is
+/// enabled so the viewer can author the `neko-input` DataChannel.
+pub fn create_consumer_transport_options_with_server(
+    server: WebRtcServer,
+) -> WebRtcTransportOptions {
+    let mut opts = WebRtcTransportOptions::new_with_server(server);
     opts.enable_sctp = true;
     opts.max_send_message_size = 262_144;
     opts
