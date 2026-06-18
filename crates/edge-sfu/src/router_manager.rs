@@ -916,7 +916,10 @@ impl RouterManager {
             Some(s) => Some(ProducerSample {
                 has_viewers,
                 byte_count: s.byte_count,
-                packets_lost: s.packets_lost,
+                // `ProducerStat.packets_lost` is `i32` (can be negative
+                // briefly per RTCP arithmetic); clamp to a non-negative
+                // cumulative count for our delta math.
+                packets_lost: s.packets_lost.max(0) as u64,
                 fraction_lost: s.fraction_lost,
                 score: s.score,
                 bitrate: s.bitrate,
