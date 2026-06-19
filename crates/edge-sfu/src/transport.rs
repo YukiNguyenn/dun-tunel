@@ -39,9 +39,9 @@ const DEFAULT_PLAIN_RTP_MIN_PORT: u16 = 5_000;
 const DEFAULT_PLAIN_RTP_MAX_PORT: u16 = 9_999;
 
 /// RTP payload type the PlainTransport Producer expects from Neko's
-/// `rtpvp8pay pt=96`. Exposed so edge-control can echo it back to dun-api
-/// → dun-app → the owner's GStreamer pipeline, keeping a single source of
-/// truth for the VP8 wire shape.
+/// payloader. VP9 TEST BUILD: the pipeline now emits `rtpvp9pay pt=96`
+/// (was `rtpvp8pay pt=96`); the PT value is unchanged so only the codec
+/// mime differs. Exposed so edge-control can echo it to the owner.
 pub const PLAIN_PAYLOAD_TYPE: u8 = 96;
 const PLAIN_CLOCK_RATE: u32 = 90_000;
 /// Fixed RTP SSRC the Producer is bound to (Neko `udpsink ssrc=22222222`).
@@ -250,7 +250,7 @@ pub fn plain_producer_rtp_parameters() -> RtpParameters {
     RtpParameters {
         mid: None,
         codecs: vec![RtpCodecParameters::Video {
-            mime_type: MimeTypeVideo::Vp8,
+            mime_type: MimeTypeVideo::Vp9,
             payload_type: PLAIN_PAYLOAD_TYPE,
             clock_rate: NonZeroU32::new(PLAIN_CLOCK_RATE).unwrap(),
             parameters: RtpCodecParametersParameters::default(),

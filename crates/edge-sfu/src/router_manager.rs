@@ -1273,12 +1273,13 @@ fn default_media_codecs() -> Vec<RtpCodecCapability> {
             rtcp_feedback: vec![RtcpFeedback::TransportCc],
         },
         RtpCodecCapability::Video {
-            mime_type: MimeTypeVideo::Vp8,
+            mime_type: MimeTypeVideo::Vp9,
             preferred_payload_type: None,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             parameters: RtpCodecParametersParameters::default(),
             // No `RtcpFeedback::Nack` — see Phase 0 RESULTS.md for SRTP
-            // replay flood rationale.
+            // replay flood rationale. VP9 TEST BUILD: consumer-facing
+            // feedback set is codec-independent (same as the VP8 baseline).
             rtcp_feedback: vec![
                 RtcpFeedback::NackPli,
                 RtcpFeedback::CcmFir,
