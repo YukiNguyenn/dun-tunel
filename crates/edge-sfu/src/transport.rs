@@ -167,6 +167,15 @@ pub fn create_plain_transport_options_on_port(
     opts.comedia = true;
     opts
 }
+/// Offset added to a worker's public mux port to derive its LAN hairpin
+/// mux port when `SFU_ANNOUNCED_IP_LAN` is configured. mediasoup binds
+/// one socket per listen info, so the public and LAN candidates MUST sit
+/// on distinct UDP ports (the same `ip:port` twice is `EADDRINUSE`).
+/// 1000 comfortably exceeds any realistic worker count, so per-worker
+/// public ports (`rtc_min + idx`) and LAN ports (`rtc_min + idx + 1000`)
+/// never overlap.
+const LAN_MUX_PORT_OFFSET: u16 = 1000;
+
 /// Build the per-worker [`WebRtcServer`] options bound to a SINGLE UDP
 /// port (`port`). Every viewer `WebRtcTransport` created against this
 /// server multiplexes onto that one port (mediasoup is ICE-Lite and
@@ -175,15 +184,17 @@ pub fn create_plain_transport_options_on_port(
 /// the symmetric counterpart to Neko's `NEKO_WEBRTC_UDPMUX` on the owner
 /// side.
 ///
-/// NOTE: a `WebRtcServer` binds one socket per listen info, and binding
-/// `0.0.0.0:port` twice collides (`EADDRINUSE`). The optional
-/// `SFU_ANNOUNCED_IP_LAN` hairpin candidate therefore CANNOT share the
-/// same fixed port, so it is intentionally NOT advertised here — viewers
-/// are remote (public `announced_ip`) in production. The owner-side
-/// udpsink still uses the LAN host via `media_lan_host()` on the separate
-/// PlainTransport, which is unaffected.
+/// Same-LAN hairpin: when `SFU_ANNOUNCED_IP_LAN` is set (the edge VPS and
+/// the viewer share one NAT / public IP — typical self-host / dev), we
+/// add a SECOND listen info announcing the LAN-private address on a
+/// distinct mux port (`port + LAN_MUX_PORT_OFFSET`). mediasoup then emits
+/// both ICE candidates per viewer transport: a remote viewer uses the
+/// public `announced_ip`, while a same-LAN viewer — whose router usually
+/// can't NAT-loopback to the edge's own public IP — picks the private
+/// candidate and connects directly. Costs one extra UDP port per worker,
+/// and ONLY when the env var is set (empty in production → single port).
 pub fn create_webrtc_server_options(listen: &RouterListenInfo, port: u16) -> WebRtcServerOptions {
-    let infos = WebRtcServerListenInfos::new(ListenInfo {
+    let mut infos = WebRtcServerListenInfos::new(ListenInfo {
         protocol: Protocol::Udp,
         ip: listen.listen_ip,
         announced_address: Some(listen.announced_ip.to_string()),
@@ -194,6 +205,19 @@ pub fn create_webrtc_server_options(listen: &RouterListenInfo, port: u16) -> Web
         send_buffer_size: None,
         recv_buffer_size: None,
     });
+    if let Some(lan_ip) = listen.lan_announced_ip {
+        infos = infos.insert(ListenInfo {
+            protocol: Protocol::Udp,
+            ip: listen.listen_ip,
+            announced_address: Some(lan_ip.to_string()),
+            expose_internal_ip: false,
+            port: Some(port.saturating_add(LAN_MUX_PORT_OFFSET)),
+            port_range: None,
+            flags: None,
+            send_buffer_size: None,
+            recv_buffer_size: None,
+        });
+    }
     WebRtcServerOptions::new(infos)
 }
 
