@@ -16,6 +16,7 @@
 //!   client → Consume { producerId }
 //!   server → Consumed { id, producerId, kind, rtpParameters }
 //!   client → ConsumerResume { id }
+//!   client → SetPreferredLayers { id, spatialLayer, temporalLayer }
 //!   # ── input path (optional, task 7.2) ──
 //!   client → ConnectInputTransport { dtlsParameters }
 //!   server → ConnectedInputTransport
@@ -227,10 +228,10 @@ enum ClientMessage {
     #[serde(rename_all = "camelCase")]
     ConsumerResume { id: ConsumerId },
     // ── Quality control (Hướng 2) ──────────────────────────────────────
-    // The viewer picks a preferred VP8 temporal layer (framerate tier) for
-    // its video consumer, or `temporalLayer: null` to hand control back to
-    // mediasoup's per-consumer bandwidth estimator (auto). `spatialLayer`
-    // is always 0 (the source is single-spatial-layer L1T3).
+    // The viewer picks a preferred VP9 simulcast spatial layer:
+    // 0 = 540p, 1 = 720p, 2 = source/1080p. `temporalLayer: null` keeps
+    // temporal selection unpinned because the current source is spatial-only
+    // simulcast, not VP9 SVC.
     #[serde(rename_all = "camelCase")]
     SetPreferredLayers {
         id: ConsumerId,
@@ -472,6 +473,12 @@ async fn run_session(
                 spatial_layer,
                 temporal_layer,
             } => {
+                let quality = match spatial_layer {
+                    0 => "540p",
+                    1 => "720p",
+                    2 => "1080p",
+                    _ => "invalid",
+                };
                 // Best-effort: a failure here leaves the consumer at its
                 // current layer and must NOT drop the connection — the
                 // video keeps playing. We log + send a non-terminal Error
@@ -491,6 +498,16 @@ async fn run_session(
                         "set_preferred_layers failed"
                     );
                     send_error(&mut socket, "set_preferred_layers_failed").await?;
+                } else {
+                    tracing::info!(
+                        %session_id,
+                        %viewer_id,
+                        consumer_id = %id,
+                        spatial_layer,
+                        temporal_layer = ?temporal_layer,
+                        quality,
+                        "set_preferred_layers ok"
+                    );
                 }
             }
             // ── Input handshake (task 7.2) ──────────────────────────────

@@ -65,16 +65,20 @@ struct ProducerActivity {
 }
 
 /// One sample of the plain video producer's inbound RTP health
-/// (the owner→edge leg). Lets the monitor both detect starvation
-/// (`byte_count`) and log loss so we can localise stutter (compare
-/// against the viewer-side edge→viewer loss the client logs).
+/// (the owner→edge leg). The VP9 producer is simulcast, so the
+/// counters below aggregate every inbound RTP stream/SSRC. This lets
+/// the monitor both detect starvation (`byte_count`) and log loss so we
+/// can localise stutter (compare against the viewer-side edge→viewer
+/// loss the client logs).
 struct ProducerSample {
     has_viewers: bool,
+    rtp_streams: usize,
     byte_count: u64,
     packets_lost: u64,
-    /// RTCP fraction lost (0-255 ≈ 0-100%) over the last interval.
+    /// Worst RTCP fraction lost among VP9 simulcast RTP streams
+    /// (0-255 ~= 0-100%) over the last interval.
     fraction_lost: u8,
-    /// Producer transmission quality score (0-10).
+    /// Worst producer transmission quality score (0-10) among streams.
     score: u8,
     bitrate: u32,
 }
@@ -292,11 +296,11 @@ impl RouterManager {
             .context("produce on plain transport")?;
 
         // Audio producer on the SAME PlainTransport. The GStreamer
-        // pipeline funnels both VP8 (pt=96 ssrc=22222222) and Opus
-        // (pt=111 ssrc=22222223) RTP into the one UDP port; mediasoup
-        // demuxes by SSRC. If the owner's pipeline has no audio branch
-        // (older dun-app), no Opus packets ever arrive and this
-        // producer simply stays silent — harmless.
+        // pipeline funnels VP9 simulcast (pt=96, ssrc=22222220/21/22)
+        // plus Opus (pt=111, ssrc=22222223) RTP into the one UDP port;
+        // mediasoup demuxes by SSRC. If the owner's pipeline has no audio
+        // branch (older dun-app), no Opus packets ever arrive and this
+        // producer simply stays silent -- harmless.
         let audio_rtp_parameters = plain_audio_producer_rtp_parameters();
         let audio_producer = plain_transport
             .produce(ProducerOptions::new(MediaKind::Audio, audio_rtp_parameters))
@@ -887,15 +891,14 @@ impl RouterManager {
     }
 
     /// Set the preferred spatial/temporal layers for a viewer's video
-    /// consumer (quality control, Hướng 2). The GStreamer source encodes
-    /// VP8 L1T3 (one spatial layer, three temporal layers), so:
-    ///   - `spatial_layer` is always 0 (single spatial layer).
-    ///   - `temporal_layer = Some(0|1|2)` pins a framerate tier
-    ///     (~7.5 / 15 / 30 fps).
-    ///   - `temporal_layer = None` hands control back to mediasoup's
-    ///     per-consumer bandwidth estimator (the "auto" mode): it sends
-    ///     the highest tier the viewer's link sustains and steps down on
-    ///     congestion — YouTube-style auto-degrade, per viewer.
+    /// consumer (quality control). The GStreamer source publishes VP9
+    /// simulcast with independent spatial encodes, so:
+    ///   - `spatial_layer = 0|1|2` selects 540p / 720p / source-1080p.
+    ///   - `temporal_layer = None` leaves temporal selection unpinned;
+    ///     the current VP9 branches are spatial-only simulcast, not SVC.
+    ///   - Picking the highest spatial layer with temporal unset keeps
+    ///     mediasoup's per-consumer bandwidth estimator free to step down
+    ///     on congestion.
     ///
     /// Idempotent and best-effort: an unknown session/viewer/consumer is
     /// an error the WS handler logs but does not treat as fatal (the
@@ -908,6 +911,13 @@ impl RouterManager {
         spatial_layer: u8,
         temporal_layer: Option<u8>,
     ) -> anyhow::Result<()> {
+        if spatial_layer > 2 {
+            anyhow::bail!("invalid VP9 simulcast spatial layer: {spatial_layer}");
+        }
+        if temporal_layer.is_some() {
+            anyhow::bail!("VP9 simulcast source does not expose temporal layers");
+        }
+
         let consumer = {
             let state = self
                 .inner
@@ -950,29 +960,41 @@ impl RouterManager {
         let has_viewers = !guard.viewers.is_empty();
         let producer = guard.plain_producer.as_ref()?;
         let stats = producer.get_stats().await.ok()?;
-        // The plain video producer has exactly one RtpStreamRecv; pick the
-        // richest stat (max byte_count). Empty before the first RTP packet.
-        match stats.into_iter().max_by_key(|s| s.byte_count) {
-            Some(s) => Some(ProducerSample {
+        if stats.is_empty() {
+            return Some(ProducerSample {
                 has_viewers,
-                byte_count: s.byte_count,
-                // `ProducerStat.packets_lost` is `i32` (can be negative
-                // briefly per RTCP arithmetic); clamp to a non-negative
-                // cumulative count for our delta math.
-                packets_lost: s.packets_lost.max(0) as u64,
-                fraction_lost: s.fraction_lost,
-                score: s.score,
-                bitrate: s.bitrate,
-            }),
-            None => Some(ProducerSample {
-                has_viewers,
+                rtp_streams: 0,
                 byte_count: 0,
                 packets_lost: 0,
                 fraction_lost: 0,
                 score: 0,
                 bitrate: 0,
-            }),
+            });
         }
+
+        let mut sample = ProducerSample {
+            has_viewers,
+            rtp_streams: 0,
+            byte_count: 0,
+            packets_lost: 0,
+            fraction_lost: 0,
+            score: 10,
+            bitrate: 0,
+        };
+        for stat in stats {
+            sample.rtp_streams += 1;
+            sample.byte_count = sample.byte_count.saturating_add(stat.byte_count);
+            // `ProducerStat.packets_lost` is `i32` (can be negative
+            // briefly per RTCP arithmetic); clamp to a non-negative
+            // cumulative count for our delta math.
+            sample.packets_lost = sample
+                .packets_lost
+                .saturating_add(stat.packets_lost.max(0) as u64);
+            sample.fraction_lost = sample.fraction_lost.max(stat.fraction_lost);
+            sample.score = sample.score.min(stat.score);
+            sample.bitrate = sample.bitrate.saturating_add(stat.bitrate);
+        }
+        Some(sample)
     }
 
     /// Tear down and recreate the session's PlainTransport + video/audio
@@ -1116,6 +1138,7 @@ impl RouterManager {
                     tracing::info!(
                         session_id = %sid,
                         leg = "owner->edge",
+                        rtp_streams = sample.rtp_streams,
                         bitrate_kbps = sample.bitrate / 1000,
                         fraction_lost_pct = (sample.fraction_lost as f32) / 255.0 * 100.0,
                         packets_lost_total = sample.packets_lost,
@@ -1278,8 +1301,8 @@ fn default_media_codecs() -> Vec<RtpCodecCapability> {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             parameters: RtpCodecParametersParameters::default(),
             // No `RtcpFeedback::Nack` — see Phase 0 RESULTS.md for SRTP
-            // replay flood rationale. VP9 TEST BUILD: consumer-facing
-            // feedback set is codec-independent (same as the VP8 baseline).
+            // replay flood rationale. Consumer-facing feedback set is
+            // codec-independent (same list as the prior VP8 build).
             rtcp_feedback: vec![
                 RtcpFeedback::NackPli,
                 RtcpFeedback::CcmFir,

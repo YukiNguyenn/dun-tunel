@@ -16,12 +16,12 @@ pub mod viewer_cap;
 pub use input_envelope::InputEnvelope;
 pub use neko_input_bridge::NekoInputBridge;
 pub use router_manager::{
-    ConsumedInfo, ConsumerTransportInfo, ProvisionedRouter, RouterManager, SessionState,
-    ViewerSlot,
+    ConsumedInfo, ConsumerTransportInfo, ProvisionedRouter, RouterManager, SessionState, ViewerSlot,
 };
 pub use snapshot_reporter::SessionSnapshotReporter;
 pub use transport::{RouterListenInfo, PLAIN_PAYLOAD_TYPE, PLAIN_SSRC};
 
+pub use mediasoup::data_producer::{DataProducerId, DataProducerOptions};
 /// Re-export of mediasoup types needed by callers (edge-control's
 /// SFU WS handler) so they don't have to depend on the heavy
 /// `mediasoup` crate transitively. This keeps `mediasoup-sys`
@@ -33,10 +33,9 @@ pub use transport::{RouterListenInfo, PLAIN_PAYLOAD_TYPE, PLAIN_SSRC};
 /// path keeps the dependency surface symmetrical with the PoC
 /// viewer code.
 pub use mediasoup::prelude::{
-    ConsumerId, DtlsParameters, IceCandidate, IceParameters, ProducerId,
-    RtpCapabilities, RtpCapabilitiesFinalized, SctpStreamParameters, TransportId,
+    ConsumerId, DtlsParameters, IceCandidate, IceParameters, ProducerId, RtpCapabilities,
+    RtpCapabilitiesFinalized, SctpStreamParameters, TransportId,
 };
-pub use mediasoup::data_producer::{DataProducerId, DataProducerOptions};
 
 /// Maximum viewers per session (R8.8 — flat cap 30).
 pub const VIEWER_CAP_PER_SESSION: u32 = 30;

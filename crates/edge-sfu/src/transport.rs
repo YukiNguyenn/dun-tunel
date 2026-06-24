@@ -7,6 +7,7 @@
 
 use mediasoup::prelude::*;
 use mediasoup_types::data_structures::Protocol;
+use mediasoup_types::scalability_modes::ScalabilityMode;
 use std::env;
 use std::net::IpAddr;
 use std::num::{NonZeroU32, NonZeroU8};
@@ -39,13 +40,22 @@ const DEFAULT_PLAIN_RTP_MIN_PORT: u16 = 5_000;
 const DEFAULT_PLAIN_RTP_MAX_PORT: u16 = 9_999;
 
 /// RTP payload type the PlainTransport Producer expects from Neko's
-/// payloader. VP9 TEST BUILD: the pipeline now emits `rtpvp9pay pt=96`
-/// (was `rtpvp8pay pt=96`); the PT value is unchanged so only the codec
-/// mime differs. Exposed so edge-control can echo it to the owner.
+/// `rtpvp9pay pt=96`. The PT value is shared by every VP9 simulcast
+/// branch in the owner pipeline and the producer.
 pub const PLAIN_PAYLOAD_TYPE: u8 = 96;
 const PLAIN_CLOCK_RATE: u32 = 90_000;
-/// Fixed RTP SSRC the Producer is bound to (Neko `udpsink ssrc=22222222`).
-pub const PLAIN_SSRC: u32 = 22_222_222;
+/// Low spatial simulcast layer SSRC (GStreamer `rtpvp9pay ... ssrc=22222220`).
+pub const PLAIN_LOW_SSRC: u32 = 22_222_220;
+/// Medium spatial simulcast layer SSRC (`ssrc=22222221`).
+pub const PLAIN_MID_SSRC: u32 = 22_222_221;
+/// High spatial simulcast layer SSRC (`ssrc=22222222`).
+pub const PLAIN_HIGH_SSRC: u32 = 22_222_222;
+/// Back-compat alias for API fields that can only echo a single SSRC.
+/// The actual Producer is simulcast and binds all three video SSRCs.
+pub const PLAIN_SSRC: u32 = PLAIN_HIGH_SSRC;
+const PLAIN_LOW_MAX_BITRATE: u32 = 1_000_000;
+const PLAIN_MID_MAX_BITRATE: u32 = 2_500_000;
+const PLAIN_HIGH_MAX_BITRATE: u32 = 4_000_000;
 
 /// RTP payload type for the Opus audio producer fed by the GStreamer
 /// `rtpopuspay pt=111` branch. Audio + video share ONE PlainTransport
@@ -233,13 +243,13 @@ pub fn create_consumer_transport_options_with_server(
     opts
 }
 
-/// RTP parameters of the producer fed by the gstreamer pipeline. Must
-/// match Neko's `rtpvp8pay pt=96` exactly — payload type, clock rate,
-/// fixed SSRC.
+/// RTP parameters of the producer fed by the GStreamer simulcast
+/// pipeline. Must match Neko's `rtpvp9pay pt=96` branches exactly:
+/// payload type, clock rate and the three fixed video SSRCs.
 ///
-/// Codec contract (Data Model M2, single source of truth): VP8,
-/// `pt=96`, `ssrc=22222222`, `clockRate=90000`. The producer carries an
-/// EMPTY `rtcp_feedback` list — it MUST NEVER include
+/// Codec contract (Data Model M2, single source of truth): VP9,
+/// `pt=96`, `ssrc=22222220/22222221/22222222`, `clockRate=90000`.
+/// The producer carries an EMPTY `rtcp_feedback` list — it MUST NEVER include
 /// `RtcpFeedback::Nack`. PlainTransport has no retransmit cache, so a
 /// negotiated Nack triggers an SRTP replay flood ("index too old") when
 /// the GStreamer pipeline resets sequence numbers on Neko reconnect (see
@@ -258,20 +268,26 @@ pub fn plain_producer_rtp_parameters() -> RtpParameters {
             rtcp_feedback: vec![],
         }],
         header_extensions: vec![],
-        encodings: vec![RtpEncodingParameters {
-            ssrc: Some(PLAIN_SSRC),
-            // NOTE: a `scalabilityMode = "L1T3"` was declared here to
-            // pair with a temporal-scalability GStreamer pipeline, but
-            // that pipeline was reverted (the image's vp8enc rejected the
-            // value-array props → Neko HTTP 500 / no video). With a flat
-            // single-layer source, declaring L1T3 here would lie to
-            // mediasoup about layers that don't exist. Leave it at the
-            // default (L1T1). Re-add ONLY together with a verified
-            // temporal-scalability pipeline in `container_service.rs`.
-            ..RtpEncodingParameters::default()
-        }],
+        encodings: vec![
+            video_encoding(PLAIN_LOW_SSRC, PLAIN_LOW_MAX_BITRATE),
+            video_encoding(PLAIN_MID_SSRC, PLAIN_MID_MAX_BITRATE),
+            video_encoding(PLAIN_HIGH_SSRC, PLAIN_HIGH_MAX_BITRATE),
+        ],
         rtcp: RtcpParameters::default(),
         msid: None,
+    }
+}
+
+fn video_encoding(ssrc: u32, max_bitrate: u32) -> RtpEncodingParameters {
+    RtpEncodingParameters {
+        ssrc: Some(ssrc),
+        codec_payload_type: Some(PLAIN_PAYLOAD_TYPE),
+        max_bitrate: Some(max_bitrate),
+        // Each simulcast branch is an independent VP9 stream (L1T1).
+        // Do not declare SVC modes here; the GStreamer pipeline does not
+        // emit VP9 spatial SVC payload descriptors.
+        scalability_mode: ScalabilityMode::None,
+        ..RtpEncodingParameters::default()
     }
 }
 
@@ -331,18 +347,17 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Pull the payload type, clock rate, SSRC and rtcp_feedback out of a
-    /// single-codec producer `RtpParameters`. Returns `None` if the shape
-    /// ever deviates from the locked "one codec + one encoding" contract so
-    /// the property fails loudly instead of silently skipping the assert.
-    fn dissect(
-        params: &RtpParameters,
-    ) -> Option<(u8, u32, Option<u32>, Vec<RtcpFeedback>)> {
-        // Data Model M2: exactly one codec and one encoding on the producer.
-        if params.codecs.len() != 1 || params.encodings.len() != 1 {
+    /// Pull the payload type, clock rate, video SSRCs and rtcp_feedback out
+    /// of a producer `RtpParameters`. Returns `None` if the shape ever
+    /// deviates from the locked "one codec + N encodings" contract so the
+    /// property fails loudly instead of silently skipping the assert.
+    fn dissect(params: &RtpParameters) -> Option<(u8, u32, Vec<Option<u32>>, Vec<RtcpFeedback>)> {
+        // Data Model M2: exactly one codec; video has three simulcast
+        // encodings, audio has one encoding.
+        if params.codecs.len() != 1 || params.encodings.is_empty() {
             return None;
         }
-        let ssrc = params.encodings[0].ssrc;
+        let ssrcs = params.encodings.iter().map(|e| e.ssrc).collect();
         match &params.codecs[0] {
             RtpCodecParameters::Video {
                 payload_type,
@@ -358,7 +373,7 @@ mod tests {
             } => Some((
                 *payload_type,
                 clock_rate.get(),
-                ssrc,
+                ssrcs,
                 rtcp_feedback.clone(),
             )),
         }
@@ -368,7 +383,7 @@ mod tests {
         /// Property 5: Codec lock-step (video).
         ///
         /// However many times we rebuild the params, the video producer
-        /// always carries `pt=96 ssrc=22222222 clockRate=90000` and an
+        /// always carries `pt=96`, three simulcast SSRCs and an
         /// `rtcp_feedback` list that never contains `RtcpFeedback::Nack`
         /// (Data Model M2 — empty list on the PlainTransport producer).
         ///
@@ -376,15 +391,21 @@ mod tests {
         #[test]
         fn video_producer_holds_codec_lock_step(_seed in any::<u64>()) {
             let params = plain_producer_rtp_parameters();
-            let (pt, clock_rate, ssrc, rtcp_feedback) =
-                dissect(&params).expect("video producer must be single codec + single encoding");
+            let (pt, clock_rate, ssrcs, rtcp_feedback) =
+                dissect(&params).expect("video producer must be single codec + simulcast encodings");
 
             prop_assert_eq!(pt, PLAIN_PAYLOAD_TYPE);
             prop_assert_eq!(pt, 96);
             prop_assert_eq!(clock_rate, PLAIN_CLOCK_RATE);
             prop_assert_eq!(clock_rate, 90_000);
-            prop_assert_eq!(ssrc, Some(PLAIN_SSRC));
-            prop_assert_eq!(ssrc, Some(22_222_222));
+            prop_assert_eq!(
+                ssrcs,
+                vec![
+                    Some(PLAIN_LOW_SSRC),
+                    Some(PLAIN_MID_SSRC),
+                    Some(PLAIN_HIGH_SSRC),
+                ]
+            );
             // Never any Nack on the PlainTransport-backed producer.
             prop_assert!(!rtcp_feedback.contains(&RtcpFeedback::Nack));
             // M2: the producer feedback list is empty entirely.
@@ -400,15 +421,14 @@ mod tests {
         #[test]
         fn audio_producer_holds_codec_lock_step(_seed in any::<u64>()) {
             let params = plain_audio_producer_rtp_parameters();
-            let (pt, clock_rate, ssrc, rtcp_feedback) =
+            let (pt, clock_rate, ssrcs, rtcp_feedback) =
                 dissect(&params).expect("audio producer must be single codec + single encoding");
 
             prop_assert_eq!(pt, PLAIN_AUDIO_PAYLOAD_TYPE);
             prop_assert_eq!(pt, 111);
             prop_assert_eq!(clock_rate, PLAIN_AUDIO_CLOCK_RATE);
             prop_assert_eq!(clock_rate, 48_000);
-            prop_assert_eq!(ssrc, Some(PLAIN_AUDIO_SSRC));
-            prop_assert_eq!(ssrc, Some(22_222_223));
+            prop_assert_eq!(ssrcs, vec![Some(PLAIN_AUDIO_SSRC)]);
             prop_assert!(!rtcp_feedback.contains(&RtcpFeedback::Nack));
             prop_assert!(rtcp_feedback.is_empty());
         }
@@ -420,14 +440,21 @@ mod tests {
     /// noisy.
     #[test]
     fn builders_match_data_model_m2() {
-        let (vpt, vclock, vssrc, vfb) =
+        let (vpt, vclock, vssrcs, vfb) =
             dissect(&plain_producer_rtp_parameters()).expect("video shape");
-        assert_eq!((vpt, vclock, vssrc), (96, 90_000, Some(22_222_222)));
+        assert_eq!(
+            (vpt, vclock, vssrcs),
+            (
+                96,
+                90_000,
+                vec![Some(22_222_220), Some(22_222_221), Some(22_222_222),]
+            )
+        );
         assert!(vfb.is_empty());
 
-        let (apt, aclock, assrc, afb) =
+        let (apt, aclock, assrcs, afb) =
             dissect(&plain_audio_producer_rtp_parameters()).expect("audio shape");
-        assert_eq!((apt, aclock, assrc), (111, 48_000, Some(22_222_223)));
+        assert_eq!((apt, aclock, assrcs), (111, 48_000, vec![Some(22_222_223)]));
         assert!(afb.is_empty());
     }
 }

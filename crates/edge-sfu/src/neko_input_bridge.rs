@@ -81,11 +81,7 @@ impl NekoInputBridge {
     /// `neko_ws_url` is the Neko v3 admin WebSocket URL (`ws://` or `wss://`);
     /// `token` is attached as an `Authorization: Bearer <token>` header on the
     /// upgrade request.
-    pub async fn connect(
-        session_id: &str,
-        neko_ws_url: &str,
-        token: &str,
-    ) -> Result<Arc<Self>> {
+    pub async fn connect(session_id: &str, neko_ws_url: &str, token: &str) -> Result<Arc<Self>> {
         // Fast path: an already-connected bridge for this session.
         if let Some(existing) = registry().get(session_id) {
             tracing::debug!(
@@ -419,10 +415,7 @@ mod tests {
             text: "hello".to_string(),
             ts: 1,
         });
-        assert_eq!(
-            ev,
-            json!({ "event": "control/clipboard", "text": "hello" })
-        );
+        assert_eq!(ev, json!({ "event": "control/clipboard", "text": "hello" }));
     }
 
     #[test]
@@ -533,8 +526,11 @@ mod tests {
     /// KB (including past the 8192-byte clamp) with arbitrary unicode.
     fn arb_envelope() -> impl Strategy<Value = InputEnvelope> {
         prop_oneof![
-            (any::<u16>(), any::<u16>(), any::<u64>())
-                .prop_map(|(x, y, ts)| InputEnvelope::Move { x, y, ts }),
+            (any::<u16>(), any::<u16>(), any::<u64>()).prop_map(|(x, y, ts)| InputEnvelope::Move {
+                x,
+                y,
+                ts
+            }),
             (any::<i16>(), any::<i16>(), any::<u64>())
                 .prop_map(|(dx, dy, ts)| InputEnvelope::Scroll { dx, dy, ts }),
             (any::<u64>(), any::<u64>()).prop_map(|(key, ts)| InputEnvelope::KeyDown { key, ts }),

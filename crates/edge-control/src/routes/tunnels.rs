@@ -82,7 +82,7 @@ pub async fn create(
     // 4b. RTP transport — DIRECT UDP, not via rathole.
     //
     // The previous design (Phase 2 task 10.B.1 draft) tried to tunnel
-    // VP8 RTP through a rathole UDP service block bound to the same
+    // RTP through a rathole UDP service block bound to the same
     // port mediasoup's PlainTransport had just opened. That double
     // bind is fundamentally impossible: two UDP sockets cannot share
     // a port, so rathole-server fell into an infinite
@@ -142,9 +142,9 @@ pub async fn create(
         // Direct-UDP media ingest (Phase 2 SFU). The owner's GStreamer
         // udpsink targets `<edge_public_host>:<media_rtp_port>`; dun-api
         // fills in the host from the region map since edge-control sits
-        // behind NAT. RTP payload type + ssrc come from the single
-        // source of truth in edge-sfu so Neko's rtpvp8pay matches the
-        // Producer the SFU created.
+        // behind NAT. RTP payload type + high-layer SSRC come from the
+        // single source of truth in edge-sfu so Neko's VP9 simulcast
+        // payloader matches the Producer the SFU created.
         media_rtp_port: Some(provisioned.plain_rtp_port),
         media_payload_type: Some(edge_sfu::PLAIN_PAYLOAD_TYPE),
         media_ssrc: Some(edge_sfu::PLAIN_SSRC),
