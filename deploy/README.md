@@ -27,7 +27,10 @@ Phase 1 deploys 1 region (SIN); Phase 3 adds IAD + FRA.
    DUN_API_KEY=<24+ char shared secret>
    CADDY_ADMIN_URL=http://127.0.0.1:2019
    RATHOLE_CONFIG_PATH=/etc/rathole/server.toml
-   RATHOLE_PID_FILE=/run/rathole/rathole.pid
+   # RATHOLE_PID_FILE: LEAVE UNSET with upstream rathole — it has no
+   # SIGHUP handler, so the reload signal TERMINATES the whole server
+   # and drops every live tunnel. rathole's own config file-watch
+   # hot-reloads only the changed service.
    PERSISTENT_QUEUE_DIR=/var/lib/dun-tunel/queue
    TUNNEL_JWT_SECRET_V1=<base64-32-bytes>
    TUNNEL_JWT_SECRET_V2=<base64-32-bytes>

@@ -2,7 +2,7 @@
 
 use crate::state::AppState;
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use std::sync::Arc;
@@ -18,6 +18,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/tunnels", post(tunnels::create))
         .route("/v1/tunnels/:id", delete(tunnels::deprovision))
+        // Rotate the rathole shared secret when dun-api re-mints the
+        // tunnel JWT (resume/refresh) — see tunnels::update_token.
+        .route("/v1/tunnels/:id/token", patch(tunnels::update_token))
         .route("/v1/tunnels/:id/sfu/router", post(sfu::create_router))
         .route("/v1/tunnels/:id/sfu/viewer/:viewer_id", delete(sfu::remove_viewer))
         // WebSocket signaling for the viewer mediasoup-client. Caddy

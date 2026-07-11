@@ -56,6 +56,30 @@ impl ServiceRegistry {
         self.persist_and_reload().await
     }
 
+    /// Rotate the shared secret of an EXISTING service in place.
+    ///
+    /// dun-api re-mints the tunnel JWT on `/tunnels/:id/resume` (and
+    /// refresh-token); rathole authenticates by comparing raw wire bytes
+    /// against this entry, so the entry must be updated in lock-step or
+    /// every post-resume handshake fails with `Incorrect token` forever.
+    /// Returns `Ok(false)` when the service is unknown on this edge
+    /// (restart wiped the in-memory registry, or the session was already
+    /// cleaned up) — the HTTP layer maps that to 404 so dun-api can fail
+    /// the resume instead of handing the client an unusable token.
+    pub async fn update_token(&self, session_id: &str, raw_token: &str) -> EdgeResult<bool> {
+        match self.inner.services.get_mut(session_id) {
+            Some(mut entry) => {
+                // Field is named `token_hash` but holds the RAW JWT — see
+                // the register call-site comment in edge-control tunnels.rs.
+                entry.token_hash = raw_token.to_string();
+                drop(entry);
+                self.persist_and_reload().await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub async fn list(&self) -> Vec<RatholeService> {
         self.inner.services.iter().map(|e| e.value().clone()).collect()
     }
@@ -172,6 +196,33 @@ mod tests {
         let toml = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(toml.contains("sess1"));
         assert!(toml.contains("hash1"));
+    }
+
+    #[tokio::test]
+    async fn update_token_rewrites_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rathole.toml");
+        let reg = ServiceRegistry::new(path.clone());
+
+        reg.register(RatholeService {
+            name: "sess1".into(),
+            token_hash: "token-a".into(),
+            bind_addr: "0.0.0.0:11001".into(),
+            transport: None,
+        })
+        .await
+        .unwrap();
+
+        // Unknown service → Ok(false), file untouched.
+        assert!(!reg.update_token("nope", "token-x").await.unwrap());
+
+        // Known service → token swapped in memory AND on disk.
+        assert!(reg.update_token("sess1", "token-b").await.unwrap());
+        let listed = reg.list().await;
+        assert_eq!(listed[0].token_hash, "token-b");
+        let toml = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(toml.contains("token-b"));
+        assert!(!toml.contains("token-a"));
     }
 
     #[tokio::test]

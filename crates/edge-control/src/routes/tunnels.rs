@@ -1,4 +1,4 @@
-//! POST /v1/tunnels, DELETE /v1/tunnels/:id
+//! POST /v1/tunnels, PATCH /v1/tunnels/:id/token, DELETE /v1/tunnels/:id
 
 use crate::state::AppState;
 use axum::{
@@ -9,7 +9,53 @@ use axum::{
 use edge_shared::types::{
     CaddyRoute, CreateSessionReq, CreateSessionResp, RatholeService, SessionId,
 };
+use serde::Deserialize;
 use std::sync::Arc;
+
+/// Body of `PATCH /v1/tunnels/:id/token`. Mirrors the create request's
+/// `tunnelToken` field: the RAW re-minted tunnel JWT (never the sha256
+/// hash — rathole byte-compares the wire token, see `create` step 2).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTokenReq {
+    pub tunnel_token: String,
+}
+
+/// PATCH /v1/tunnels/:id/token — rotate an existing session's rathole
+/// shared secret.
+///
+/// dun-api re-mints the tunnel JWT on `/tunnels/:id/resume` (dun-app
+/// restart) and `/tunnels/:id/refresh-token`, then the client reconnects
+/// presenting the NEW raw bytes. Without this endpoint the rathole server
+/// kept the create-time token and every reconnect died in an endless
+/// `Authentication failed: <session>: Incorrect token` retry loop.
+/// 404 = no such service on this edge (registry wiped by a restart, or
+/// the session was cleaned up) so dun-api can fail the resume instead of
+/// handing the client a token nobody accepts.
+pub async fn update_token(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<SessionId>,
+    Json(req): Json<UpdateTokenReq>,
+) -> StatusCode {
+    match state
+        .rathole
+        .update_token(&session_id, &req.tunnel_token)
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(%session_id, "rathole token rotated");
+            StatusCode::NO_CONTENT
+        }
+        Ok(false) => {
+            tracing::warn!(%session_id, "rathole token rotate: unknown service");
+            StatusCode::NOT_FOUND
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, %session_id, "rathole token rotate failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
