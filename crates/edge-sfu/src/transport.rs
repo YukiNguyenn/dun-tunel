@@ -243,6 +243,14 @@ pub fn create_consumer_transport_options_with_server(
     let mut opts = WebRtcTransportOptions::new_with_server(server);
     opts.enable_sctp = true;
     opts.max_send_message_size = 262_144;
+    // mediasoup's default initial BWE is 600 kbps — below even the LOW
+    // simulcast layer (1 Mbps), so every new viewer attached to 540p and
+    // stayed there until probing grew the estimate (observed stuck at
+    // ~652 kbps when probes timed out). 5 Mbps covers the HIGH layer
+    // (4 Mbps) + audio so a preferred-1080p viewer starts at full
+    // quality; TWCC drops the estimate within seconds on real
+    // congestion and the consumer down-switches normally.
+    opts.initial_available_outgoing_bitrate = 5_000_000;
     opts
 }
 
