@@ -1113,9 +1113,39 @@ impl RouterManager {
                         continue;
                     };
                     if !sample.has_viewers {
-                        // No one watching → broadcast may be intentionally
-                        // stopped. Don't reprovision; reset tracking.
-                        activity.remove(&sid);
+                        // No one watching → don't reprovision (there is no
+                        // viewer to serve, and an intentional idle-stop is
+                        // indistinguishable from a crash from RTP alone).
+                        //
+                        // But do NOT drop the tracking entry. If the producer
+                        // FLOWED and then went silent (e.g. the owner's
+                        // container restarted, so Docker SNAT moved its
+                        // outbound source port and comedia is now locked onto
+                        // a dead tuple), we must remember `ever_flowed` and the
+                        // silence start (`last_change`). Dropping the entry here
+                        // (the old behaviour) recreated it with `last_change =
+                        // now` on the next viewer return, so the 12s starve
+                        // timer never accumulated and comedia was never
+                        // re-locked → every returning viewer saw a permanent
+                        // black screen (rtp_streams:0 forever). Entries for
+                        // sessions that truly end are pruned by `retain` above.
+                        //
+                        // Keep the flow timestamp CURRENT while idle so we don't
+                        // misread a stale byte jump as "flowing" on the next
+                        // viewer return: with idle_stop OFF the broadcast keeps
+                        // running with no viewers (byte_count grows); without
+                        // this update a returning viewer would see bytes >
+                        // last_bytes, reset last_change, and delay a genuinely
+                        // needed re-lock by ~12s. Only reprovision is gated on
+                        // viewers — tracking is not.
+                        if let Some(entry) = activity.get_mut(&sid) {
+                            let bytes = sample.byte_count;
+                            if bytes > entry.last_bytes {
+                                entry.last_bytes = bytes;
+                                entry.last_change = Instant::now();
+                                entry.ever_flowed = true;
+                            }
+                        }
                         continue;
                     }
                     let bytes = sample.byte_count;
