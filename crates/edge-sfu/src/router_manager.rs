@@ -65,7 +65,7 @@ struct ProducerActivity {
 }
 
 /// One sample of the plain video producer's inbound RTP health
-/// (the owner→edge leg). The VP9 producer is simulcast, so the
+/// (the owner→edge leg). The video producer is simulcast (VP8, was VP9), so the
 /// counters below aggregate every inbound RTP stream/SSRC. This lets
 /// the monitor both detect starvation (`byte_count`) and log loss so we
 /// can localise stutter (compare against the viewer-side edge→viewer
@@ -75,7 +75,7 @@ struct ProducerSample {
     rtp_streams: usize,
     byte_count: u64,
     packets_lost: u64,
-    /// Worst RTCP fraction lost among VP9 simulcast RTP streams
+    /// Worst RTCP fraction lost among video simulcast RTP streams
     /// (0-255 ~= 0-100%) over the last interval.
     fraction_lost: u8,
     /// Worst producer transmission quality score (0-10) among streams.
@@ -296,7 +296,7 @@ impl RouterManager {
             .context("produce on plain transport")?;
 
         // Audio producer on the SAME PlainTransport. The GStreamer
-        // pipeline funnels VP9 simulcast (pt=96, ssrc=22222220/21/22)
+        // pipeline funnels VP8 simulcast (pt=96, ssrc=22222220/21/22; was VP9)
         // plus Opus (pt=111, ssrc=22222223) RTP into the one UDP port;
         // mediasoup demuxes by SSRC. If the owner's pipeline has no audio
         // branch (older dun-app), no Opus packets ever arrive and this
@@ -891,11 +891,11 @@ impl RouterManager {
     }
 
     /// Set the preferred spatial/temporal layers for a viewer's video
-    /// consumer (quality control). The GStreamer source publishes VP9
-    /// simulcast with independent spatial encodes, so:
+    /// consumer (quality control). The GStreamer source publishes VP8
+    /// simulcast (was VP9) with independent spatial encodes, so:
     ///   - `spatial_layer = 0|1|2` selects 540p / 720p / source-1080p.
     ///   - `temporal_layer = None` leaves temporal selection unpinned;
-    ///     the current VP9 branches are spatial-only simulcast, not SVC.
+    ///     the branches are spatial-only simulcast, not SVC.
     ///   - Picking the highest spatial layer with temporal unset keeps
     ///     mediasoup's per-consumer bandwidth estimator free to step down
     ///     on congestion.
@@ -912,10 +912,10 @@ impl RouterManager {
         temporal_layer: Option<u8>,
     ) -> anyhow::Result<()> {
         if spatial_layer > 2 {
-            anyhow::bail!("invalid VP9 simulcast spatial layer: {spatial_layer}");
+            anyhow::bail!("invalid simulcast spatial layer: {spatial_layer}");
         }
         if temporal_layer.is_some() {
-            anyhow::bail!("VP9 simulcast source does not expose temporal layers");
+            anyhow::bail!("simulcast source does not expose temporal layers");
         }
 
         let consumer = {
@@ -1296,7 +1296,10 @@ fn default_media_codecs() -> Vec<RtpCodecCapability> {
             rtcp_feedback: vec![RtcpFeedback::TransportCc],
         },
         RtpCodecCapability::Video {
-            mime_type: MimeTypeVideo::Vp9,
+            // VP9 (kept for reference — mediasoup worker rejects VP9
+            // simulcast, SIMULCAST allowlist is VP8/H264 only):
+            // mime_type: MimeTypeVideo::Vp9,
+            mime_type: MimeTypeVideo::Vp8,
             preferred_payload_type: None,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             parameters: RtpCodecParametersParameters::default(),

@@ -40,11 +40,14 @@ const DEFAULT_PLAIN_RTP_MIN_PORT: u16 = 5_000;
 const DEFAULT_PLAIN_RTP_MAX_PORT: u16 = 9_999;
 
 /// RTP payload type the PlainTransport Producer expects from Neko's
-/// `rtpvp9pay pt=96`. The PT value is shared by every VP9 simulcast
-/// branch in the owner pipeline and the producer.
+/// `rtpvp8pay pt=96`. The PT value is shared by every simulcast branch
+/// in the owner pipeline and the producer.
+/// VP9 history: the multilayer experiment ran `rtpvp9pay pt=96`, but the
+/// mediasoup worker hard-rejects VP9 + simulcast (SIMULCAST allowlist is
+/// VP8/H264 only), so the wire codec is VP8 again. Same PT either way.
 pub const PLAIN_PAYLOAD_TYPE: u8 = 96;
 const PLAIN_CLOCK_RATE: u32 = 90_000;
-/// Low spatial simulcast layer SSRC (GStreamer `rtpvp9pay ... ssrc=22222220`).
+/// Low spatial simulcast layer SSRC (GStreamer `rtpvp8pay ... ssrc=22222220`).
 pub const PLAIN_LOW_SSRC: u32 = 22_222_220;
 /// Medium spatial simulcast layer SSRC (`ssrc=22222221`).
 pub const PLAIN_MID_SSRC: u32 = 22_222_221;
@@ -244,11 +247,14 @@ pub fn create_consumer_transport_options_with_server(
 }
 
 /// RTP parameters of the producer fed by the GStreamer simulcast
-/// pipeline. Must match Neko's `rtpvp9pay pt=96` branches exactly:
+/// pipeline. Must match Neko's `rtpvp8pay pt=96` branches exactly:
 /// payload type, clock rate and the three fixed video SSRCs.
 ///
-/// Codec contract (Data Model M2, single source of truth): VP9,
+/// Codec contract (Data Model M2, single source of truth): VP8,
 /// `pt=96`, `ssrc=22222220/22222221/22222222`, `clockRate=90000`.
+/// (VP9 history: the contract was VP9 during the multilayer experiment;
+/// the mediasoup worker rejects it at produce time —
+/// `video/VP9 codec not supported for simulcast` — so VP8 it is.)
 /// The producer carries an EMPTY `rtcp_feedback` list — it MUST NEVER include
 /// `RtcpFeedback::Nack`. PlainTransport has no retransmit cache, so a
 /// negotiated Nack triggers an SRTP replay flood ("index too old") when
@@ -260,7 +266,10 @@ pub fn plain_producer_rtp_parameters() -> RtpParameters {
     RtpParameters {
         mid: None,
         codecs: vec![RtpCodecParameters::Video {
-            mime_type: MimeTypeVideo::Vp9,
+            // VP9 (kept for reference — mediasoup worker rejects VP9
+            // simulcast, SIMULCAST allowlist is VP8/H264 only):
+            // mime_type: MimeTypeVideo::Vp9,
+            mime_type: MimeTypeVideo::Vp8,
             payload_type: PLAIN_PAYLOAD_TYPE,
             clock_rate: NonZeroU32::new(PLAIN_CLOCK_RATE).unwrap(),
             parameters: RtpCodecParametersParameters::default(),
@@ -283,9 +292,10 @@ fn video_encoding(ssrc: u32, max_bitrate: u32) -> RtpEncodingParameters {
         ssrc: Some(ssrc),
         codec_payload_type: Some(PLAIN_PAYLOAD_TYPE),
         max_bitrate: Some(max_bitrate),
-        // Each simulcast branch is an independent VP9 stream (L1T1).
+        // Each simulcast branch is an independent VP8 stream (L1T1).
+        // (was: independent VP9 streams, same layout)
         // Do not declare SVC modes here; the GStreamer pipeline does not
-        // emit VP9 spatial SVC payload descriptors.
+        // emit spatial SVC payload descriptors for either codec.
         scalability_mode: ScalabilityMode::None,
         ..RtpEncodingParameters::default()
     }
