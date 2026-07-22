@@ -85,11 +85,24 @@ impl AppState {
             upstream = %edge_control_upstream.as_deref().unwrap_or("(disabled)"),
             "SFU signalling split-route enabled (/v1/sfu/* → edge-control loopback)"
         );
+        // Same secret both sides: Caddy stamps it on the forwarded
+        // request, `sfu_ws::ws_handler` requires it. Sourcing both from
+        // one config field is what keeps them in lockstep — set it on
+        // only one side and every viewer WS upgrade is rejected.
+        if cfg.gate_secret.is_some() {
+            tracing::info!("viewer-WS gate enabled (X-Edge-Gate-Secret required on /v1/sfu/*)");
+        } else {
+            tracing::warn!(
+                "EDGE_GATE_SECRET unset — X-Forwarded-Sub is trusted unconditionally on the \
+                 viewer WS; anyone able to reach edge-control directly can take over a session"
+            );
+        }
         let caddy = AdminClient::with_upstreams(
             cfg.caddy_admin_url.clone(),
             dun_api_upstream,
             auth_gate_upstream,
             edge_control_upstream,
+            cfg.gate_secret.clone(),
         );
 
         // Bootstrap the wildcard TLS policy when both domain + CF

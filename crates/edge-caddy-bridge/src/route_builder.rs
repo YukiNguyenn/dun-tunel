@@ -235,11 +235,22 @@ pub fn route_id(host: &str) -> String {
 /// page. When `None`, those paths fall through to the tunnel — which
 /// will 404 because the container has no SFU handler. Provided as
 /// `None` only by tests that exercise the legacy behaviour.
+///
+/// `gate_secret` is the shared secret edge-control expects as
+/// `X-Edge-Gate-Secret` on the viewer WS upgrade. When `Some`, it is
+/// stamped onto the request forwarded to edge-control — proving the
+/// request transited Caddy's `forward_auth` rather than hitting
+/// edge-control directly, which is what makes the `X-Forwarded-Sub`
+/// claim trustworthy. When `None` the header is not sent, which is
+/// only safe while edge-control leaves `EDGE_GATE_SECRET` unset (it
+/// then skips the check). The two MUST be rolled out together: a
+/// secret set on edge-control but not here rejects every viewer.
 pub fn build_route(
     route: &CaddyRoute,
     dun_api_upstream: Option<&str>,
     auth_gate_upstream: Option<&str>,
     edge_control_upstream: Option<&str>,
+    gate_secret: Option<&str>,
 ) -> Value {
     let tunnel_handle = json!({
         "handler": "reverse_proxy",
@@ -412,6 +423,20 @@ pub fn build_route(
         // page and the SFU WS. The gate is in-process EdDSA verify
         // (~200µs) so the duplicate is acceptable.
         if let Some(edge_upstream) = edge_control_upstream {
+            // Headers stamped onto the request that actually reaches
+            // edge-control. `set` (not `add`) is load-bearing for the
+            // gate secret: it OVERWRITES any copy the client smuggled
+            // in, so a viewer cannot forge the proof-of-transit and
+            // then aim `X-Forwarded-Sub` at someone else's session.
+            let mut edge_request_set = json!({
+                "Host": [route.host.clone()],
+                "X-Forwarded-Host": ["{http.request.host}"],
+                "X-Forwarded-Proto": ["{http.request.scheme}"],
+                "X-Forwarded-For": ["{http.request.remote.host}"],
+            });
+            if let Some(secret) = gate_secret {
+                edge_request_set["X-Edge-Gate-Secret"] = json!([secret.to_string()]);
+            }
             let edge_handle = json!({
                 "handler": "reverse_proxy",
                 "transport": {
@@ -426,12 +451,7 @@ pub fn build_route(
                 // shape as the tunnel handle.
                 "headers": {
                     "request": {
-                        "set": {
-                            "Host": [route.host.clone()],
-                            "X-Forwarded-Host": ["{http.request.host}"],
-                            "X-Forwarded-Proto": ["{http.request.scheme}"],
-                            "X-Forwarded-For": ["{http.request.remote.host}"],
-                        }
+                        "set": edge_request_set,
                     },
                     "response": viewer_response_security_headers(),
                 },
@@ -649,7 +669,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec!["/api/ws".into()],
         };
-        let v = build_route(&r, None, None, None);
+        let v = build_route(&r, None, None, None, None);
         assert_eq!(v["@id"], "dun-tunel-abc_sin_dun-studio_xyz");
         assert_eq!(v["match"][0]["host"][0], "abc.sin.dun-studio.xyz");
     }
@@ -661,7 +681,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), None, None);
+        let v = build_route(&r, Some("127.0.0.1:3010"), None, None, None);
         let inner = &v["handle"][0]["routes"];
         // Index 0 is now the hard-block /host entry; api split is at
         // index 1.
@@ -698,7 +718,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, None, None, None);
+        let v = build_route(&r, None, None, None, None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // Hard-block /host (idx 0) + tunnel default (idx 1) = 2 entries.
         assert_eq!(inner.len(), 2);
@@ -715,7 +735,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None);
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None, None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // 0: hard-block /host, 1: dun-api split, 2: public assets,
         // 3: auth-gated tunnel. (No SFU block when edge_control is None.)
@@ -765,6 +785,7 @@ mod tests {
             Some("127.0.0.1:3010"),
             Some("127.0.0.1:9444"),
             Some("127.0.0.1:9443"),
+            None,
         );
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // 0: hard-block, 1: dun-api split, 2: public assets,
@@ -792,6 +813,73 @@ mod tests {
         assert_eq!(
             routes_2xx[1]["handle"][0]["upstreams"][0]["dial"],
             "127.0.0.1:9443"
+        );
+
+        // No secret configured → header absent, so edge-control (which
+        // then also has EDGE_GATE_SECRET unset) keeps accepting the WS.
+        assert!(
+            routes_2xx[1]["handle"][0]["headers"]["request"]["set"]["X-Edge-Gate-Secret"]
+                .is_null()
+        );
+    }
+
+    /// The gate secret must land on the request that reaches
+    /// edge-control, under `set` so a client-supplied copy is
+    /// overwritten rather than passed through.
+    #[test]
+    fn build_route_stamps_gate_secret_on_edge_control_request() {
+        let r = CaddyRoute {
+            host: "abc.sin.dun-studio.xyz".into(),
+            upstream: "127.0.0.1:11042".into(),
+            ws_paths: vec![],
+        };
+        let v = build_route(
+            &r,
+            Some("127.0.0.1:3010"),
+            Some("127.0.0.1:9444"),
+            Some("127.0.0.1:9443"),
+            Some("s3cr3t-gate-value"),
+        );
+        let inner = v["handle"][0]["routes"].as_array().unwrap();
+        let routes_2xx = inner[3]["handle"][0]["handle_response"][0]["routes"]
+            .as_array()
+            .unwrap();
+        let edge_req_set = &routes_2xx[1]["handle"][0]["headers"]["request"]["set"];
+        assert_eq!(edge_req_set["X-Edge-Gate-Secret"][0], "s3cr3t-gate-value");
+        // The pre-existing forwarding headers must survive alongside it.
+        assert_eq!(edge_req_set["Host"][0], "abc.sin.dun-studio.xyz");
+        assert_eq!(edge_req_set["X-Forwarded-Host"][0], "{http.request.host}");
+    }
+
+    /// The secret is for edge-control only — it must never be stamped
+    /// onto the request forwarded into the customer's container.
+    #[test]
+    fn gate_secret_never_reaches_the_tunnel_upstream() {
+        let r = CaddyRoute {
+            host: "abc.sin.dun-studio.xyz".into(),
+            upstream: "127.0.0.1:11042".into(),
+            ws_paths: vec![],
+        };
+        let v = build_route(
+            &r,
+            Some("127.0.0.1:3010"),
+            Some("127.0.0.1:9444"),
+            Some("127.0.0.1:9443"),
+            Some("s3cr3t-gate-value"),
+        );
+        let inner = v["handle"][0]["routes"].as_array().unwrap();
+        // inner[4] is the generic auth-gated tunnel block.
+        let tunnel_2xx = inner[4]["handle"][0]["handle_response"][0]["routes"]
+            .as_array()
+            .unwrap();
+        let tunnel_req_set = &tunnel_2xx[1]["handle"][0]["headers"]["request"]["set"];
+        assert!(
+            tunnel_req_set["X-Edge-Gate-Secret"].is_null(),
+            "gate secret leaked to the container upstream: {tunnel_req_set}"
+        );
+        assert!(
+            !serde_json::to_string(&inner[4]).unwrap().contains("s3cr3t-gate-value"),
+            "gate secret appears somewhere in the tunnel route block"
         );
     }
 
@@ -840,7 +928,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, None, None, None);
+        let v = build_route(&r, None, None, None, None);
         let inner = &v["handle"][0]["routes"];
         // [0] hard-block /host, [1] tunnel default. Security headers
         // are on the tunnel handler.
@@ -875,7 +963,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None);
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None, None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // Inner route order with full wiring (api + assets + auth):
         //   [0] hard-block /host (defense in depth)
@@ -901,7 +989,7 @@ mod tests {
             upstream: "127.0.0.1:11042".into(),
             ws_paths: vec![],
         };
-        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None);
+        let v = build_route(&r, Some("127.0.0.1:3010"), Some("127.0.0.1:9444"), None, None);
         let inner = v["handle"][0]["routes"].as_array().unwrap();
         // Hard-block must be first so Caddy returns 403 before any
         // auth gate / dun-api / tunnel handler runs.

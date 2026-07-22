@@ -43,13 +43,20 @@ struct AdminClientInner {
     /// `auth_gate_upstream`) so the viewer mediasoup-client can open
     /// `/v1/sfu/viewer/ws` against the same origin as the page.
     edge_control_upstream: Option<String>,
+    /// Shared secret stamped as `X-Edge-Gate-Secret` on requests
+    /// forwarded to edge-control, proving they transited Caddy's
+    /// `forward_auth` instead of hitting edge-control directly. Must
+    /// be rolled out in lockstep with edge-control's `EDGE_GATE_SECRET`
+    /// — set there but not here and every viewer WS upgrade is
+    /// rejected.
+    gate_secret: Option<String>,
     routes: DashMap<String, CaddyRoute>,
     http: reqwest::Client,
 }
 
 impl AdminClient {
     pub fn new(base_url: String) -> Self {
-        Self::with_upstreams(base_url, None, None, None)
+        Self::with_upstreams(base_url, None, None, None, None)
     }
 
     /// Build an `AdminClient` that knows where to find dun-api so it
@@ -57,7 +64,7 @@ impl AdminClient {
     /// Auth gate is left disabled — use [`with_upstreams`] to enable
     /// the cookie auth sidecar.
     pub fn with_dun_api(base_url: String, dun_api_upstream: Option<String>) -> Self {
-        Self::with_upstreams(base_url, dun_api_upstream, None, None)
+        Self::with_upstreams(base_url, dun_api_upstream, None, None, None)
     }
 
     /// Build an `AdminClient` that knows where to find both dun-api
@@ -72,6 +79,7 @@ impl AdminClient {
         dun_api_upstream: Option<String>,
         auth_gate_upstream: Option<String>,
         edge_control_upstream: Option<String>,
+        gate_secret: Option<String>,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -83,6 +91,7 @@ impl AdminClient {
                 dun_api_upstream,
                 auth_gate_upstream,
                 edge_control_upstream,
+                gate_secret,
                 routes: DashMap::new(),
                 http,
             }),
@@ -122,6 +131,7 @@ impl AdminClient {
             self.inner.dun_api_upstream.as_deref(),
             self.inner.auth_gate_upstream.as_deref(),
             self.inner.edge_control_upstream.as_deref(),
+            self.inner.gate_secret.as_deref(),
         );
 
         // Attempt 1: PUT /id/<route_id> for in-place update.
