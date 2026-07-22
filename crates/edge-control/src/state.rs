@@ -39,6 +39,12 @@ pub struct AppState {
     /// DELETEs would silently leak Caddy routes.
     pub session_subdomains: Arc<DashMap<SessionId, String>>,
     pub subdomain_store: SubdomainStore,
+    /// Shared secret for `x-edge-api-key` on the control routes. When `None`,
+    /// `require_api_key` fails closed (rejects every control request).
+    pub dun_api_key: Option<String>,
+    /// Optional Caddy-injected `X-Edge-Gate-Secret` required on the viewer WS
+    /// upgrade. When `Some`, ws_handler rejects a request lacking it.
+    pub gate_secret: Option<String>,
 }
 
 impl AppState {
@@ -199,12 +205,33 @@ impl AppState {
             Err(e) => tracing::warn!(error = ?e, "subdomain_store load_all failed; starting empty"),
         }
 
+        // Register HS256 verify keys, treating an empty/whitespace secret as
+        // ABSENT (compose `${VAR:-}` yields Some("") when unset — a zero-byte
+        // key makes every forged token verify). Refuse startup if no usable key
+        // remains, and reject dangerously short secrets.
         let mut jwt = JwtVerifier::new();
-        if let Some(secret) = &cfg.jwt_secret_v1 {
-            jwt.add_key("v1", secret.as_bytes());
+        let mut jwt_key_count = 0usize;
+        for (kid, secret) in [("v1", &cfg.jwt_secret_v1), ("v2", &cfg.jwt_secret_v2)] {
+            let Some(secret) = secret else { continue };
+            if secret.trim().is_empty() {
+                tracing::warn!(kid, "TUNNEL_JWT_SECRET is empty — ignoring (no key registered)");
+                continue;
+            }
+            if secret.len() < 32 {
+                anyhow::bail!(
+                    "TUNNEL_JWT_SECRET_{} is too short ({} bytes); require >= 32 — refusing to start",
+                    kid.to_uppercase(),
+                    secret.len()
+                );
+            }
+            jwt.add_key(kid, secret.as_bytes());
+            jwt_key_count += 1;
         }
-        if let Some(secret) = &cfg.jwt_secret_v2 {
-            jwt.add_key("v2", secret.as_bytes());
+        if jwt_key_count == 0 {
+            anyhow::bail!(
+                "no valid TUNNEL_JWT_SECRET_V1/V2 configured — refusing to start (an empty secret \
+                 would accept forged tunnel tokens)"
+            );
         }
         // Wire revocation oracle if API key is configured. In dev/test
         // environments without DUN_API_KEY we leave it unset — verifier
@@ -232,6 +259,8 @@ impl AppState {
             jwt,
             session_subdomains,
             subdomain_store,
+            dun_api_key: cfg.dun_api_key.clone(),
+            gate_secret: cfg.gate_secret.clone(),
         })
     }
 }

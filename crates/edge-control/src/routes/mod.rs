@@ -15,26 +15,41 @@ pub mod tunnels;
 pub mod verify;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Control-plane routes dun-api calls with `x-edge-api-key` (create/delete/
+    // token-rotate/snapshot). Gated by `require_api_key`, which fails CLOSED if
+    // DUN_API_KEY is unset — so this plane is never reachable unauthenticated.
+    let keyed = Router::new()
         .route("/v1/tunnels", post(tunnels::create))
         .route("/v1/tunnels/:id", delete(tunnels::deprovision))
         // Rotate the rathole shared secret when dun-api re-mints the
         // tunnel JWT (resume/refresh) — see tunnels::update_token.
         .route("/v1/tunnels/:id/token", patch(tunnels::update_token))
-        .route("/v1/tunnels/:id/sfu/router", post(sfu::create_router))
-        .route("/v1/tunnels/:id/sfu/viewer/:viewer_id", delete(sfu::remove_viewer))
-        // WebSocket signaling for the viewer mediasoup-client. Caddy
-        // exposes this at `https://<sub>:8443/sfu/viewer/ws` via the
-        // split-route block in `edge-caddy-bridge::route_builder`. The
-        // edge-viewer-gate forward_auth check runs first, so reaching
-        // this handler implies a verified `viewer-cookie` JWT — the
-        // handler still re-checks the `X-Forwarded-Sub` header
-        // matches the requested session as defense in depth.
-        .route("/v1/sfu/viewer/ws", get(sfu_ws::ws_handler))
-        // Used by rathole-bridge sidecar (or co-located guard) to verify a
-        // tunnel JWT presented during the rathole handshake.
-        .route("/v1/tunnel/verify", post(verify::verify_tunnel_handler))
         .route("/v1/state/snapshot", get(snapshot::get))
-        .route("/healthz", get(healthz::check))
-        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::api_key::require_api_key,
+        ));
+
+    // Routes NOT gated by the api key:
+    // - `/v1/tunnels/:id/sfu/*` — per-tunnel SFU signaling; its caller is not
+    //   the `x-edge-api-key` client, so keying it would break signaling. It
+    //   still requires a valid, known tunnel id. (Follow-up: authenticate once
+    //   the caller is confirmed.)
+    // - `/v1/sfu/viewer/ws` — viewer WS; authenticated by Caddy's forward_auth
+    //   (`X-Forwarded-Sub`) plus the optional `X-Edge-Gate-Secret`, NOT the api
+    //   key (browsers cannot attach it).
+    // - `/v1/tunnel/verify` — called by the co-located rathole-bridge guard over
+    //   loopback during the handshake; MUST stay key-free or the tunnel breaks.
+    // - `/healthz` — liveness.
+    let open = Router::new()
+        .route("/v1/tunnels/:id/sfu/router", post(sfu::create_router))
+        .route(
+            "/v1/tunnels/:id/sfu/viewer/:viewer_id",
+            delete(sfu::remove_viewer),
+        )
+        .route("/v1/sfu/viewer/ws", get(sfu_ws::ws_handler))
+        .route("/v1/tunnel/verify", post(verify::verify_tunnel_handler))
+        .route("/healthz", get(healthz::check));
+
+    keyed.merge(open).with_state(state)
 }

@@ -93,6 +93,26 @@ pub async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
+    // Anti-spoof gate: `X-Forwarded-Sub` is trustworthy ONLY if the request
+    // came through Caddy's forward_auth. A direct hit to edge-control (bypassing
+    // Caddy) lets an attacker set X-Forwarded-Sub freely and take over any
+    // session's view + input. When a gate secret is configured, require Caddy's
+    // injected `X-Edge-Gate-Secret` (constant-time) — Caddy sets it only after
+    // forward_auth and strips any client-supplied copy. Unset = not enforced
+    // (legacy; only safe when edge-control is unreachable except via Caddy).
+    if let Some(expected) = state.gate_secret.as_deref() {
+        let provided = headers
+            .get("x-edge-gate-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !crate::auth::api_key::ct_eq(provided.as_bytes(), expected.as_bytes()) {
+            tracing::warn!(
+                session = %q.session,
+                "ws upgrade rejected: missing/invalid X-Edge-Gate-Secret (direct hit bypassing Caddy?)"
+            );
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
     // `X-Forwarded-Sub` is set by `edge-viewer-gate` after a
     // successful cookie verify. Caddy's `forward_auth` block at the
     // edge in front of `/sfu/viewer/ws` ensures the gate runs first;

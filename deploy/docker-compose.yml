@@ -33,6 +33,11 @@ services:
       PERSISTENT_QUEUE_DIR: "/state/queue"
       TUNNEL_JWT_SECRET_V1: ${TUNNEL_JWT_SECRET_V1:-}
       TUNNEL_JWT_SECRET_V2: ${TUNNEL_JWT_SECRET_V2:-}
+      # Anti-spoof gate for the viewer WS. Opt-in: leave EMPTY until Caddy's
+      # route_builder injects X-Edge-Gate-Secret (and strips any client copy)
+      # on the /sfu/viewer/ws split route — setting it before that is wired
+      # rejects every viewer upgrade. See routes/sfu_ws.rs.
+      EDGE_GATE_SECRET: ${EDGE_GATE_SECRET:-}
       # Domain + CF token cho edge-control bootstrap wildcard TLS
       # policy qua Caddy admin API (thay site block cũ trong
       # Caddyfile.tpl).

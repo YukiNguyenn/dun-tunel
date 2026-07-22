@@ -37,6 +37,13 @@ pub struct EdgeConfig {
     /// container's WS / HTTP endpoints. When `None`, viewer subdomains
     /// stay open to anyone with the URL — only acceptable for dev.
     pub viewer_gate_upstream: Option<String>,
+    /// Shared secret that Caddy injects as `X-Edge-Gate-Secret` on the viewer-WS
+    /// split route AFTER its `forward_auth` runs. When set, edge-control's
+    /// ws_handler requires a matching header — proving the request transited
+    /// Caddy (not a direct hit), which closes the `X-Forwarded-Sub` spoof. Unset
+    /// = not enforced (legacy; only safe when edge-control is unreachable except
+    /// via Caddy). Caddy MUST also strip any client-supplied copy of this header.
+    pub gate_secret: Option<String>,
 }
 
 impl EdgeConfig {
@@ -88,6 +95,11 @@ impl EdgeConfig {
             })
             .or_else(|| Some("127.0.0.1:9444".to_string()));
 
+        let gate_secret = std::env::var("EDGE_GATE_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             region,
             bind_port,
@@ -105,6 +117,7 @@ impl EdgeConfig {
             share_tunnel_domain,
             cloudflare_api_token,
             viewer_gate_upstream,
+            gate_secret,
         })
     }
 }
